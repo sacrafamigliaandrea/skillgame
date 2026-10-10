@@ -144,7 +144,7 @@
     <p class="par">Ogni buca ha un <b>par</b>: il numero di colpi previsti per mandare la pallina in buca.
        Meno colpi fai, più punti porti alla tua Casa.</p>
     <div class="etichetta">Il tuo soprannome</div>
-    <input id="nome" maxlength="16" placeholder="es. Luca R." autocomplete="off" spellcheck="false">
+    <input id="nome" maxlength="16" autocomplete="off" spellcheck="false">
     <div class="etichetta">La tua Casa</div>
     <div class="scelte" id="scelteCasa"></div>
     <button class="bottone" id="btnGioca" disabled>Gioca il percorso</button>
@@ -10539,13 +10539,16 @@ function mostraGioco(si){ for(const id of ['hud','aiuto','sfidaCase']) $(id).cla
   CASE.forEach(c=>{
     const b=document.createElement('button'); b.className='scelta'; b.dataset.id=c.id;
     b.innerHTML='<span class="pallino" style="background:'+c.css+'"></span>'+c.nome;
-    b.onclick=()=>{ if(G.casa!==c.id){ rangoPrima=-1; tNotaVivo=0; } G.casa=c.id; ss('mg_casa',c.id); aggiornaMenu(); }; sc.appendChild(b);
+    b.onclick=()=>{ if(G.casa!==c.id){ rangoPrima=-1; tNotaVivo=0; } G.casa=c.id; aggiornaMenu(); }; sc.appendChild(b);
   });
-  G.casa=ss('mg_casa');
-  if(!CASE.some(c=>c.id===G.casa)) G.casa=null;
-  // soprannome come in Dita Veloci: ripulito come fa il server, ricordato solo per la sessione (i Mac sono condivisi)
-  const inp=$('nome'); G.nome=pulisciNome(ss('mg_nome')||''); inp.value=G.nome;
-  inp.addEventListener('input',()=>{ const n=pulisciNome(inp.value); if(n!==G.nome){ rangoPrima=-1; tNotaVivo=0; } G.nome=n; ss('mg_nome',n); aggiornaMenu(); });
+  // Casa e soprannome vivono solo in memoria: con Cmd+R o chiudendo il browser spariscono (iMac condivisi).
+  // Si cancellano anche le copie salvate dalle versioni precedenti, e il campo si svuota a mano perché
+  // alcuni browser ripristinano il testo dei campi al ricaricamento. Il soprannome è ripulito come fa il server.
+  try{ sessionStorage.removeItem('mg_nome'); sessionStorage.removeItem('mg_casa'); }catch(e){}
+  G.casa=null;
+  const inp=$('nome'); G.nome=''; inp.value='';
+  addEventListener('pageshow',()=>{ inp.value=G.nome; });
+  inp.addEventListener('input',()=>{ const n=pulisciNome(inp.value); if(n!==G.nome){ rangoPrima=-1; tNotaVivo=0; } G.nome=n; aggiornaMenu(); });
 }
 function aggiornaMenu(){
   document.querySelectorAll('#scelteCasa .scelta').forEach(b=>b.classList.toggle('sel',b.dataset.id===G.casa));
