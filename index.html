@@ -215,11 +215,18 @@
 // Terreno (2,5D): dossi (canaline passacavi), rampe e piattaforme (il piano dei
 // tavoli). La pallina ha un livello: 0 = pavimento o rampa, 1 = su una piattaforma.
 // Segmenti, cerchi, buca e trigger possono dichiarare liv: 0 o 1 (senza liv valgono
-// per entrambi i livelli, come le pareti dell'aula).
+// per entrambi i livelli, come le pareti dell'aula). La buca puo' dichiarare anche
+// plat: cattura solo la pallina su quella piattaforma.
+// Piattaforme inclinate (ponti): con h2 la quota va da h (lato locale x = -w/2) a h2
+// (x = +w/2) e la pendenza accelera la pallina come sulle rampe. Uscendo da una
+// piattaforma la pallina passa su un'altra che contiene il punto se la quota coincide
+// al bordo (tolleranza TOL_PIATT); se l'altra e' piu' bassa ci cade sopra; se non ce
+// n'e' nessuna scende sulla rampa legata o cade a terra.
 const FISICA=(()=>{
   const COST={R:0.025, R_BUCA:0.055, MU:0.11, G:9.81, E_PARETE:0.62, E_GAMBA:0.5,
               V_MAX:5.6, V_STOP:0.03, V_CATTURA:1.25,
-              K_ROT:5/7};            // sfera che rotola: sul pendio accelera (5/7)·g·pendenza
+              K_ROT:5/7,             // sfera che rotola: sul pendio accelera (5/7)·g·pendenza
+              TOL_PIATT:0.005};      // passaggio tra piattaforme: quote uguali al bordo entro 5 mm
   function creaPallina(x,z){ return {x,z,vx:0,vz:0,ferma:true,inBuca:false,trigVisti:new Set(),liv:0,plat:null,h:0}; }
   // curva di potenza: più fine ai valori bassi (putt corti controllabili)
   function velocitaDaPotenza(pot){ pot=Math.max(0,Math.min(1,pot)); return COST.V_MAX*Math.pow(pot,1.35); }
@@ -252,9 +259,31 @@ const FISICA=(()=>{
     return [d.h*c*c, dht*-ez, dht*ex];
   }
   const piattaforma=(m,id)=>(m.piattaforme||[]).find(q=>q.id===id);
+  // quota e pendenza di una piattaforma in (x,z); fuori dal piano vale la quota del bordo (lato locale x limitato)
+  function quotaPiatt(q,x,z){
+    if(q.h2===undefined) return {h:q.h,gx:0,gz:0};
+    const [lx]=ruota(x-q.cx,z-q.cz,-(q.ry||0)), s=(q.h2-q.h)/q.w, t=Math.max(-q.w/2,Math.min(q.w/2,lx));
+    const [gx,gz]=ruota(s,0,q.ry||0);
+    return {h:q.h+s*(t+q.w/2),gx,gz};
+  }
+  // piattaforma su cui si passa dal bordo di q (quota h0): quella che contiene (x,z), la piu' alta non sopra h0
+  function accanto(m,x,z,h0,q){
+    let best=null, hb=-1e9;
+    for(const r of (m.piattaforme||[])){
+      if(r===q || !dentroRett(x,z,r)) continue;
+      const h=quotaPiatt(r,x,z).h; if(h<=h0+COST.TOL_PIATT && h>hb){ best=r; hb=h; }
+    }
+    return best;
+  }
+  // piattaforma sotto (x,z): prima pref, poi le altre (per chi sta accanto alla pallina: mascotte, caddy)
+  function piattaformaDi(m,x,z,pref){
+    const q=piattaforma(m,pref); if(q && dentroRett(x,z,q)) return q;
+    return (m.piattaforme||[]).find(r=>r!==q && dentroRett(x,z,r))||null;
+  }
   // quota e pendenza del terreno sotto (x,z) al livello liv
   function terreno(m,x,z,liv,plat){
-    if(liv===1){ const q=piattaforma(m,plat); return {h:q?q.h:0,gx:0,gz:0,rampa:null}; }
+    if(liv===1){ const q=piattaforma(m,plat); if(!q) return {h:0,gx:0,gz:0,rampa:null};
+      const Q=quotaPiatt(q,x,z); return {h:Q.h,gx:Q.gx,gz:Q.gz,rampa:null}; }
     for(const r of (m.rampe||[])){ const q=suRampa(x,z,r); if(q){ const sl=r.hTop/q.L; return {h:sl*q.s,gx:sl*q.ex,gz:sl*q.ez,rampa:r}; } }
     let h=0,gx=0,gz=0;
     for(const d of (m.rilievi||[])){ const q=suDosso(x,z,d); if(q){ h+=q[0]; gx+=q[1]; gz+=q[2]; } }
@@ -279,7 +308,7 @@ const FISICA=(()=>{
   }
   // mondo = {segmenti:[{ax,az,bx,bz,liv?}], cerchi:[{x,z,r,liv?}], buca:{x,z,liv?}, trigger:[{id,x,z,r,liv?}],
   //          rilievi:[{ax,az,bx,bz,w,h}], rampe:[{ax,az,bx,bz,larghezza,hTop,piattaforma}],
-  //          piattaforme:[{id,cx,cz,w,d,ry,h}]}
+  //          piattaforme:[{id,cx,cz,w,d,ry,h,h2?}]}   (buca: anche plat)
   function passo(p,mondo,dt){
     const ev=[];
     if(p.ferma||p.inBuca) return ev;
@@ -293,13 +322,18 @@ const FISICA=(()=>{
       const v=Math.hypot(p.vx,p.vz), dv=COST.MU*COST.G*h;
       if(v<=dv){ p.vx=0; p.vz=0; } else { const k=(v-dv)/v; p.vx*=k; p.vz*=k; }
       p.x+=p.vx*h; p.z+=p.vz*h;
-      // cambi di livello: dalla cima della rampa si sale sulla piattaforma; dal bordo si cade
+      // cambi di livello: dalla cima della rampa si sale sulla piattaforma; dal bordo si passa su una
+      // piattaforma accanto (ponte), si scende dalla rampa o si cade
       if(p.liv===1){
         const q=piattaforma(mondo,p.plat);
         if(!q || !dentroRett(p.x,p.z,q)){
-          const r=(mondo.rampe||[]).find(r=>r.piattaforma===p.plat && suRampa(p.x,p.z,r));
-          if(!r) ev.push({tipo:'caduta',da:q?q.h:0});
-          p.liv=0; p.plat=null;
+          const h0=q?quotaPiatt(q,p.x,p.z).h:0, q2=q?accanto(mondo,p.x,p.z,h0,q):null;
+          if(q2){ if(quotaPiatt(q2,p.x,p.z).h<h0-COST.TOL_PIATT) ev.push({tipo:'caduta',da:h0}); p.plat=q2.id; }
+          else {
+            const r=(mondo.rampe||[]).find(r=>r.piattaforma===p.plat && suRampa(p.x,p.z,r));
+            if(!r) ev.push({tipo:'caduta',da:h0});
+            p.liv=0; p.plat=null;
+          }
         }
       } else if(rampaPrima && rampaPrima.piattaforma && !suRampa(p.x,p.z,rampaPrima)){
         const q=piattaforma(mondo,rampaPrima.piattaforma);
@@ -313,7 +347,7 @@ const FISICA=(()=>{
           p.trigVisti.add(t.id); ev.push({tipo:'trigger',id:t.id}); }
       }
       const b=mondo.buca;
-      if(b && (b.liv||0)===p.liv && Math.hypot(p.x-b.x,p.z-b.z)<COST.R_BUCA && Math.hypot(p.vx,p.vz)<COST.V_CATTURA){
+      if(b && (b.liv||0)===p.liv && (b.plat==null || b.plat===p.plat) && Math.hypot(p.x-b.x,p.z-b.z)<COST.R_BUCA && Math.hypot(p.vx,p.vz)<COST.V_CATTURA){
         p.inBuca=true; p.x=b.x; p.z=b.z; p.vx=0; p.vz=0; ev.push({tipo:'buca'}); return ev;
       }
       // si ferma solo se è lenta E il pendio non la farebbe ripartire
@@ -322,7 +356,7 @@ const FISICA=(()=>{
     }
     return ev;
   }
-  return {COST,creaPallina,velocitaDaPotenza,tira,ruota,rettangolo,distanzaArresto,passo,terreno,dentroRett,suRampa};
+  return {COST,creaPallina,velocitaDaPotenza,tira,ruota,rettangolo,distanzaArresto,passo,terreno,dentroRett,suRampa,quotaPiatt,piattaformaDi};
 })();
 /* ==== FISICA:FINE ==== */
 
@@ -437,6 +471,75 @@ function eseguiTest(F,log){
     const p=F.creaPallina(0,0); p.vx=Math.sqrt(2*F.COST.MU*F.COST.G*1.02); p.ferma=false;
     simula(p,conMondo({buca:{x:1,z:0,liv:1}}));
     assert.ok(!p.inBuca);
+  });
+  // ---------- piattaforme inclinate e passaggi tra piattaforme (il ponte della buca 6) ----------
+  // tavolo (quota .5) -> ponte lungo -z (ry 90 gradi: il lato locale x va verso -z) che sale a .6 -> bancone (.6)
+  const TAV={id:'T',cx:0,cz:0,w:1,d:1,ry:0,h:.5};                                     // z -0,5..+0,5
+  const PONTE={id:'P',cx:0,cz:-1.25,w:1.5,d:.4,ry:Math.PI/2,h:.5,h2:.6};              // z -0,5..-2,0
+  const BANC={id:'B',cx:0,cz:-2.5,w:1,d:1,ry:0,h:.6};                                 // z -2,0..-3,0
+  const sulPiano=(x,z,plat,v)=>{ const p=F.creaPallina(x,z); p.liv=1; p.plat=plat; p.ferma=false; p.vx=v[0]; p.vz=v[1]; return p; };
+  function corsa(p,m,maxT=30){                    // eventi, piattaforme toccate, quote estreme
+    const r={cad:[],plat:new Set(),hMin:9,hMax:-9,ev:[]};
+    for(let t=0;t<maxT && !p.ferma && !p.inBuca;t+=1/120){
+      for(const e of F.passo(p,m,1/120)){ r.ev.push(e); if(e.tipo==='caduta') r.cad.push(e.da); }
+      if(p.liv===1){ r.plat.add(p.plat); r.hMin=Math.min(r.hMin,p.h); r.hMax=Math.max(r.hMax,p.h); }
+    }
+    return r;
+  }
+  test('sale dal tavolo al bancone sul ponte e si ferma dove dice l\'energia',()=>{
+    const m=conMondo({piattaforme:[TAV,PONTE,BANC]}), C=F.COST;
+    const v0=Math.sqrt(2*C.MU*C.G*2.4+2*C.K_ROT*C.G*.1);            // senza ostacoli si ferma a z -2,4, sul bancone
+    const p=sulPiano(0,0,'T',[0,-v0]), r=corsa(p,m);
+    assert.equal(r.cad.length,0,'cade'); assert.ok(r.plat.has('P'),'non passa dal ponte');
+    assert.ok(p.ferma && p.liv===1 && p.plat==='B','liv='+p.liv+' plat='+p.plat);
+    assert.ok(Math.abs(p.h-.6)<1e-9 && Math.abs(r.hMax-.6)<1e-9,'quota '+p.h);
+    assert.ok(Math.abs(p.z+2.4)<.03,'z='+p.z);
+  });
+  test('sul ponte la quota segue la pendenza (a meta\' strada .55)',()=>{
+    const m=conMondo({piattaforme:[TAV,PONTE,BANC]});
+    const p=sulPiano(0,-1.25,'P',[0,-.001]); F.passo(p,m,1/120);
+    assert.ok(Math.abs(p.h-.55)<1e-3,'h='+p.h);
+    const T=F.terreno(m,0,-1.25,1,'P'); assert.ok(Math.abs(T.gz+.1/1.5)<1e-9 && Math.abs(T.gx)<1e-9,'pendenza '+T.gx+','+T.gz);
+  });
+  test('una pallina lenta torna indietro dal ponte ripido sul tavolo',()=>{
+    const RIPIDO={id:'P',cx:0,cz:-1,w:1,d:.4,ry:Math.PI/2,h:.5,h2:.7};             // 20%: da ferma riscende
+    const p=sulPiano(0,0,'T',[0,-1.3]), r=corsa(p,conMondo({piattaforme:[TAV,RIPIDO]}));
+    assert.equal(r.cad.length,0,'cade'); assert.ok(r.plat.has('P') && r.hMax>.51,'non sale sul ponte: hMax '+r.hMax);
+    assert.ok(p.ferma && p.liv===1 && p.plat==='T' && p.z>-.5,'plat='+p.plat+' z='+p.z);
+  });
+  test('cade dal lato del ponte, dalla quota del ponte',()=>{
+    const p=sulPiano(0,-1.25,'P',[1.2,0]), r=corsa(p,conMondo({piattaforme:[TAV,PONTE,BANC]}));
+    assert.equal(r.cad.length,1,'cadute '+r.cad.length); assert.ok(Math.abs(r.cad[0]-.55)<.003,'da '+r.cad[0]);
+    assert.ok(p.liv===0 && p.plat===null && p.x>.2,'liv='+p.liv+' x='+p.x);
+  });
+  test('la buca sul bancone cattura solo sul bancone',()=>{
+    const buca={x:0,z:-2.5,liv:1,plat:'B'}, C=F.COST, v=Math.sqrt(2*C.MU*C.G*.52);   // si fermerebbe 2 cm oltre
+    const sotto=F.creaPallina(0,-2); sotto.vz=-v; sotto.ferma=false;               // a terra, sotto il bancone
+    simula(sotto,conMondo({buca,piattaforme:[BANC]})); assert.ok(!sotto.inBuca,'cattura a terra');
+    const ALTRA={id:'X',cx:0,cz:-2.5,w:1,d:1,ry:0,h:.6};                          // altro piano nello stesso punto
+    const pX=sulPiano(0,-2,'X',[0,-v]); simula(pX,conMondo({buca,piattaforme:[ALTRA]})); assert.ok(!pX.inBuca,'cattura su un altro piano');
+    const pB=sulPiano(0,-2.02,'B',[0,-v]); simula(pB,conMondo({buca,piattaforme:[BANC]})); assert.ok(pB.inBuca,'non cattura sul bancone');
+  });
+  test('passa tra due piattaforme alla stessa quota senza cadere ne\' frenare',()=>{
+    const A={id:'A',cx:0,cz:0,w:1,d:1,ry:0,h:.5}, B={id:'B',cx:1,cz:0,w:1,d:1,ry:0,h:.5+.004};   // 4 mm: entro la tolleranza
+    const C=F.COST, v0=Math.sqrt(2*C.MU*C.G*1.0);                                  // si ferma a x 1,0
+    const p=sulPiano(0,0,'A',[v0,0]), r=corsa(p,conMondo({piattaforme:[A,B]}));
+    assert.equal(r.cad.length,0,'cade'); assert.ok(p.ferma && p.liv===1 && p.plat==='B','plat='+p.plat);
+    assert.ok(Math.abs(p.x-1)<.03,'x='+p.x);
+    const q=sulPiano(1,0,'B',[-v0,0]), r2=corsa(q,conMondo({piattaforme:[A,B]}));    // e indietro
+    assert.equal(r2.cad.length,0,'cade tornando'); assert.ok(q.plat==='A' && Math.abs(q.x)<.03,'plat='+q.plat+' x='+q.x);
+  });
+  test('su una piattaforma piu\' bassa accanto ci cade sopra; su una piu\' alta no',()=>{
+    const A={id:'A',cx:0,cz:0,w:1,d:1,ry:0,h:.5}, B={id:'B',cx:1,cz:0,w:1,d:1,ry:0,h:.4};
+    const p=sulPiano(0,0,'A',[1.5,0]), r=corsa(p,conMondo({piattaforme:[A,B]}));
+    assert.equal(r.cad.length,1); assert.ok(Math.abs(r.cad[0]-.5)<1e-9 && p.liv===1 && p.plat==='B','plat='+p.plat);
+    const q=sulPiano(1,0,'B',[-1.5,0]), r2=corsa(q,conMondo({piattaforme:[A,B]}));
+    assert.equal(r2.cad.length,1); assert.ok(q.liv===0 && q.plat===null,'sale sul piano piu\' alto: plat='+q.plat);
+  });
+  test('chi sta accanto alla pallina trova il piano sotto i piedi (tavolo, ponte, bancone)',()=>{
+    const m=conMondo({piattaforme:[TAV,PONTE,BANC]}), id=q=>q?q.id:null;
+    assert.equal(id(F.piattaformaDi(m,0,-.2,'P')),'T'); assert.equal(id(F.piattaformaDi(m,.1,-1.2,'T')),'P');
+    assert.equal(id(F.piattaformaDi(m,0,-2.5,'P')),'B'); assert.equal(id(F.piattaformaDi(m,.5,-1.2,'P')),null);
   });
   ris.forEach(r=>log((r[1]?'PASS  ':'FAIL  ')+r[0]+(r[2]?'  — '+r[2]:'')));
   const ko=ris.filter(r=>!r[1]).length;
@@ -5469,8 +5572,10 @@ function sedieRaccolte(m,dxOvest,dxEst){
 const BUCHE=[
   { n:1, skill:0, par:3,
     // "Corsie": il tavolone ovest arretra di 90 cm e libera la buca davanti al maxischermo.
-    // L'emblema sta sotto il tavolone, accanto all'iMac del docente: ci si arriva dalla galleria.
-    tee:{x:5.6, z:2.3}, buca:{x:-6.55, z:Z_TAV}, emblema:{x:-1.12, z:Z_TAV},
+    // L'emblema aspetta ai piedi del maxischermo, nel passaggio stretto fra lo spigolo del tavolone
+    // e la parete: chi segue la corsia delle finestre e poi tira verso la bandierina ci passa sopra
+    // col tiro verso la buca (modello "ragazzo", 200 partite: ~70%). Dal tee nessun colpo lo raggiunge.
+    tee:{x:5.6, z:2.3}, buca:{x:-6.55, z:Z_TAV}, emblema:{x:-6.55, z:Z_TAV+.35},
     disponi(){
       const m={tavoloOvest:{x:XO_LAB+.9, z:Z_TAV, ry:0}};
       sedieRaccolte(m,.9,0);
@@ -5596,8 +5701,12 @@ function emetti(nome,...a){ const L=AGGANCI[nome]; if(L) for(const f of L){ try{
    passare SOTTO una sedia se infila il varco fra le gambe. Le file sono girate di 20°
    verso il proprio varco e hanno passi diversi (64 / 60 cm), così i varchi sotto le
    sedie di file diverse non si allineano: niente "tunnel" dritto dal tee alla buca.
-   Lungo la lavagna, dietro il tee, una tribunetta di 3 sedie guarda il giocatore: sotto
-   la prima (la coda del trenino) c'è l'emblema. Prenderlo vuol dire tirare all'indietro.
+   Lungo la lavagna, dietro il tee, una tribunetta di 3 sedie guarda il giocatore.
+   L'emblema sta sul percorso ovvio: 1,7 m davanti al tee, sulla linea tee-bandierina, nell'ombra
+   che il tavolo Est getta verso il bancone (il sole entra dalle finestre). Il tiro naturale (verso
+   la bandierina, con la potenza per arrivarci) ci passa sopra senza colpi extra: modello ragazzo
+   (mira ±4°, potenza ±8%, 200 partite) lo prende il 78,5% delle volte. Lo salta chi apre di sponda
+   sulla bussola centrale (la linea del solutore: buca in 2 senza emblema).
    Firma "Il trenino delle sedie" (4,8 s, funzione di t, saltabile in ogni istante):
      0,0-0,4   fischio: la girevole fa la piroetta, le sedie si inclinano verso di lei; chi ha la
                seduta sotto un tavolo si sfila all'indietro
@@ -5605,9 +5714,10 @@ function emetti(nome,...a){ const L=AGGANCI[nome]; if(L) for(const f of L){ try{
                in testa (0,4); i tavoloni scivolano in piano quando chi stava sulla loro strada è
                già in volo: l'Ovest contro le finestre (0,85-1,45), l'Est gli si affianca (0,95-1,95)
      1,55-3,85 il trenino marcia (2,82 m): la girevole in testa gira come una majorette, le sedie
-               ancheggiano con un saltello a ogni passo; l'emblema viaggia sotto la sedia di coda
+               ancheggiano con un saltello a ogni passo
      3,45-4,25 la girevole va a parcheggiare accanto alla buca
-     3,9-4,3   secondo fischio: ogni sedia salta sulla sua piazzola girandosi verso il varco
+     3,9-4,3   secondo fischio: ogni sedia salta sulla sua piazzola girandosi verso il varco; il
+               gettone spunta con l'elastico nell'ombra del tavolo Est, davanti al tee
      4,3-4,8   ola di prova dal tee alla buca, mentre la camera scende dietro la pallina
    TECNICA DEI SALTI IN CODA (riusabile): ogni oggetto ha una sola parabola A -> Q (posa di
    partenza -> posto in coda), y = h·sin(πu), in pianta morbida, lineare o "a razzo". In
@@ -5635,23 +5745,24 @@ function emetti(nome,...a){ const L=AGGANCI[nome]; if(L) for(const f of L){ try{
    La Manona (solo grafica, la fisica non cambia): in gioco ogni sedia accanto a cui passa la
    pallina (entro 35 cm, quando la distanza torna a crescere di 10 cm) fa un saltello di 6 cm
    con un toc; in buca tutte le sedie saltano in sequenza dal tee alla buca; preso l'emblema,
-   la sua sedia fa il doppio salto.
+   la tribunetta esulta (doppio salto, una sedia dopo l'altra).
    Telecamera fra le sedie (ogniFrame): se la camera di gioco finirebbe dentro una sedia o dietro
    uno schienale, il braccio si accorcia e si alza finché la pallina torna visibile; con la
-   pallina sotto una sedia (l'emblema) la camera scende e guarda sotto la seduta.
-   Verifica: risolvi(1) chiude in 2 colpi; risolviEmblema(1) prende l'emblema al primo colpo e
-   poi servono 2 colpi (uno in più del percorso diretto).
+   pallina sotto una sedia la camera scende e guarda sotto la seduta.
+   Verifica: risolvi(1) chiude in 2 colpi; risolviEmblema(1) prende l'emblema al primo colpo (verso
+   la bandierina) e poi basta 1 colpo: emblema e buca in 2, come il percorso diretto.
    ===================================================================== */
 BUCHE[1]=(()=>{
   const ruota=FISICA.ruota, PI=Math.PI;
   // ---------- disposizione finale ----------
   const ROT=.35, PW=.64, PD=.6;                              // rotazione verso il varco, passo nelle file W / D
   const TEE={x:-3.3, z:-.9}, BUCA={x:6.35, z:.6}, GIR={x:6.2, z:1.6};
+  const EMB={x:-1.65, z:-.64};                              // emblema: sulla linea tee-bandierina, all'ombra del tavolo Est
   const TAV={tavoloOvest:{x:-3.3, z:2.13, ry:0}, tavoloEst:{x:-3.3, z:.71, ry:0}};
   // W = file attaccate alle finestre (varco verso il bancone), D = attaccate al bancone (varco verso le finestre).
   // Le file W stanno dove sotto la finestra non c'è il termosifone (x -0,42..0,68 / 2,03..3,8 / 5,08..6).
   const FILE=[{x:.15,W:true},{x:1.4,W:false},{x:2.75,W:true},{x:4.1,W:false},{x:5.45,W:true}];
-  const TRIB=[-5.6,-4.95,-4.3];                             // tribunetta lungo la lavagna (z -2,45): la prima è la coda (emblema)
+  const TRIB=[-5.6,-4.95,-4.3];                             // tribunetta lungo la lavagna (z -2,45): la prima è la coda del trenino
   const GUSCIO=[[-.227,-.258],[.227,-.258],[.227,.242],[-.227,.242]];   // pianta del guscio della sedia
   const estZ=ry=>{ const zs=GUSCIO.map(([x,z])=>ruota(x,z,ry)[1]); return [Math.min(...zs),Math.max(...zs)]; };
   // POSTI[k] = piazzola della sedia k nell'ordine del trenino (0 = coda); (mx,mz) = dove arriva marciando, sul
@@ -6089,8 +6200,8 @@ BUCHE[1]=(()=>{
         const p=posaSedia(T,k,t); o.position.set(p.x,p.y,p.z); o.rotation.set(p.rx,p.ry,p.rz);
       }
       const g=ARREDO.girevole, pg=posaGirevole(T,t); g.position.set(pg.x,pg.y,pg.z); g.rotation.set(0,pg.ry,0);
-      // l'emblema viaggia sotto la sedia di coda (posizione funzione di t; a fine firma è sulla sua piazzola)
-      const c=OGG[0]; if(c) gEmblema.position.set(c.position.x,0,c.position.z);
+      // l'emblema aspetta al suo posto, nell'ombra del tavolo Est (spunta al secondo fischio: vedi camera)
+      gEmblema.position.set(EMB.x,0,EMB.z);
       // suoni (solo se il tempo scorre: saltando la firma non partono tutti insieme)
       suona(T,t,0,()=>{ tono(2600,.07,'sine',.07); tono(2600,.07,'sine',.07,.11); });   // fischio della girevole
       if(T.b2.tuffo.length){ suona(T,t,TUFFO.giu0+.1,()=>tono(300,.18,'sine',.07,0,110)); suona(T,t,TUFFO.su1-.15,()=>tono(160,.12,'sine',.07,0,420)); }
@@ -6099,14 +6210,14 @@ BUCHE[1]=(()=>{
       T.b2.tp=t;
     },
     camera(T,t){
-      // l'emblema compare (con l'elastico) quando la sedia di coda è atterrata in fila
-      const s0=T.b2.salti[0], ue=elastico((t-s0.ts-s0.dj+.05)/.5);
+      // l'emblema spunta (con l'elastico) al secondo fischio, mentre la camera scende dietro la pallina e lo inquadra
+      const ue=elastico((t-T_SALTO-.15)/.5);
       gEmblema.visible=ue>.01; gEmblema.scale.setScalar(Math.max(.001,ue));
       // 0-0,9 s: campo largo dall'angolo della vetrata verso le porte (bandierina che salta, girevole che balza in
       // testa, tavoli che scivolano, sedie in coda).
       // 0,8-3,6 s: carrello da est a ovest lungo il lato porte (z -2, davanti al bancone e alla bussola), sempre
       // rivolto verso il trenino che marcia nelle file; alla fine scende vicino alla parete del maxischermo e guarda
-      // la tribunetta e il tee: la sedia di coda si ferma sull'emblema. Negli ultimi 1,2 s la base porta la camera
+      // la tribunetta e il tee. Negli ultimi 1,2 s la base porta la camera
       // dietro la pallina, nella stessa direzione: niente giravolte.
       const p1=V(6.35,2.65,-1.45), l1=V(-1.5,.2,.4);
       const u=ease(clamp01((t-.8)/2.8)), xc=4.4-11.1*u;
@@ -6136,7 +6247,7 @@ BUCHE[1]=(()=>{
   // la camera 1,1 m dietro di lei finirebbe dentro una sedia (schermo arancione) o dietro uno schienale. Se succede, il
   // braccio si accorcia e si alza (come per le pareti) fino al primo punto da cui la vista sulla pallina è libera; se
   // la pallina è proprio dietro uno schienale la camera sale ancora, fino a guardarla dall'alto. Con la pallina sotto
-  // una sedia (l'emblema!) la camera scende a 0,3 m e guarda sotto la seduta. Il gioco riprende la sua camera appena le
+  // una sedia la camera scende a 0,3 m e guarda sotto la seduta. Il gioco riprende la sua camera appena le
   // sedie non coprono più. Ostacoli: guscio delle sedie (fino a 0,85 m, 5 cm di margine), girevole (raggio 0,36, 1,07 m).
   const CAMS={attivo:false, pos:null, look:null};
   function inSedia(o,x,z,m){ const dx=x-o.position.x, dz=z-o.position.z, c=Math.cos(o.rotation.y), sn=Math.sin(o.rotation.y);
@@ -6203,10 +6314,11 @@ BUCHE[1]=(()=>{
   function evento(e){
     olaInit();
     if(e.tipo==='buca'){ for(let k=0;k<N;k++) salta(k,.15+.045*k,false); }        // dal tee alla buca
-    else if(e.tipo==='trigger' && e.id==='emblema'){ salta(0,0,true); rumore(.025,.06,1500); rumore(.025,.06,1500,.35); }
+    else if(e.tipo==='trigger' && e.id==='emblema'){                                // la tribunetta esulta
+      for(let k=0;k<3;k++){ salta(k,.12*k,true); rumore(.025,.06,1500,.12*k); } }
   }
 
-  return { n:2, skill:1, par:3, tee:TEE, buca:BUCA, emblema:{x:TRIB[0], z:-2.45},
+  return { n:2, skill:1, par:3, tee:TEE, buca:BUCA, emblema:{x:EMB.x, z:EMB.z},
     disponi, firma, ogniFrame, evento, esci:olaReset,
   };
 })();
@@ -6219,11 +6331,17 @@ BUCHE[1]=(()=>{
    varco di 62 cm sull'asse; la buca e' 1,8 m oltre il varco. Lungo il lato
    esterno di ogni braccio 7 sedie stanno con la seduta sotto il piano, come
    in laboratorio; le altre 14 e la girevole fanno la curva dietro la buca.
-   Emblema: nella rientranza della bussola centrale, appena oltre la soglia
-   dietro l'anta aperta: si prende di solito al secondo colpo, da oltre il
-   varco o da sotto il braccio sud (dal tee solo di sponda). La porta resta aperta
-   (anta a 130 gradi nella stanza) e il binario di legno davanti scende nel
-   prato. In fisica la bussola (un blocco pieno in costruisciMondo) diventa
+   Emblema: sul dischetto del calcio d'inizio, in mezzo all'imbuto, 1,85 m
+   davanti al tee sull'asse tee-varco-buca (dischetto e cerchio di centrocampo
+   dipinti sull'erba, il cerchio largo quanto la porta). Chi tira dritto verso
+   la bandierina, come fa chiunque al primo tentativo, lo prende con il primo
+   colpo senza colpi in piu' (modello "ragazzo": mira alla bandierina +-4 gradi,
+   potenza +-8%, 200 partite: circa 3 su 4); chi tira storto lo lascia li'.
+   La linea della buca in uno passa sul dischetto (risolviEmblema: 180 gradi,
+   potenza .8, gettone e buca nello stesso tiro). La porta della bussola resta
+   aperta (anta a 130 gradi nella stanza, la apre la firma) e il binario di
+   legno davanti scende nel prato: la rientranza e' solo un angolo in piu'.
+   In fisica la bussola (un blocco pieno in costruisciMondo) diventa
    fianchi, montanti, anta fissa e anta aperta, con la geometria disegnata
    nel blocco PORTE.
    Firma "Oh-issa!" (5,5 s, funzione di t, saltabile in ogni istante):
@@ -6276,7 +6394,7 @@ BUCHE[2]=(()=>{
   const PX=L_TAV/2-.09, PZ=(P_TAV-.12)/2, OFF=PX*sT+PZ*cT;  // pannelli a ±2,71 m dal centro, lunghi 1,28 m
   const BR={N:{x:XV+PX*cT, z:ZC+VARCO/2+OFF, ry:-TH, out:1},       // braccio lato finestre
             S:{x:XV+PX*cT, z:ZC-VARCO/2-OFF, ry:TH,  out:-1}};     // braccio lato porte
-  const TEE={x:5.55, z:ZC}, BUCA={x:XV-1.8, z:ZC}, EMB={x:-1.1, z:-2.32};
+  const TEE={x:5.55, z:ZC}, BUCA={x:XV-1.8, z:ZC}, EMB={x:3.7, z:ZC};          // gettone sul dischetto, sull'asse
   const TAVOLI=['tavoloEst','tavoloOvest'];
   // ---------- la porta della bussola centrale (misure del blocco PORTE) ----------
   const BS=AULA.bussole[0], AW=.915, PW=(BS.x1-BS.x0)-.14-AW, PHI=130*PI/180;
@@ -6488,7 +6606,7 @@ BUCHE[2]=(()=>{
   const CAM_TEE2=[V(6.3,2.3,ZC+.4),V(-1.8,.05,ZC-.05)];                 // (si avvicina piano finche' il raccordo la porta giu')
   function suonoUna(S,k,t,t0,f){ if(!S.secco && !S.suoni[k] && t>=t0 && t<t0+.15){ S.suoni[k]=1; f(); } }
 
-  // ---------- la porta e il binario (props: niente oggetti nuovi, si muovono quelli che ci sono) ----------
+  // ---------- la porta e il binario (props: si muovono quelli che ci sono) e il dischetto del gettone ----------
   let PORTA=null;
   function creaPorta(){
     const g=new THREE.Group(); g.name='buca3_porta';
@@ -6502,10 +6620,17 @@ BUCHE[2]=(()=>{
       if(Math.abs(o.position.x+b.min.x-(B.x0-.02))<.006 && Math.abs(o.position.y+b.max.y-B.h)<.006 && b.max.x-b.min.x>4) piano=o; });
     const pp=piano?piano.geometry.attributes.position:null, xp=[];
     if(pp) for(let i=0;i<pp.count;i++) if(piano.position.x+pp.getX(i)<BS.x1) xp.push([i,pp.getX(i)]);
+    // il dischetto del calcio d'inizio sotto il gettone: vernice 2 mm sopra l'erba (y .004) con polygonOffset.
+    // Il dischetto e' grande quanto la zona di presa (raggio del trigger + pallina), il cerchio largo quanto la porta.
+    const mV=STD(0xf3f2ec,{roughness:.8,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-2});
+    const DISCO=new THREE.Group(); DISCO.position.set(EMB.x,.0058,EMB.z); DISCO.visible=false; g.add(DISCO);
+    add(new THREE.CircleGeometry(.09,32).rotateX(-PI/2),mV,DISCO).receiveShadow=true;
+    add(new THREE.RingGeometry(VARCO/2-.012,VARCO/2+.012,64).rotateX(-PI/2),mV,DISCO).receiveShadow=true;
     let cor=0, scritto=null, anima=-1;
     function applica(u){
       if(pp){ for(const [i,x] of xp) pp.setX(i,u>0?BS.x1-piano.position.x+.001:x); pp.needsUpdate=true; }
       cor=u; const e=u<=0?0:u>=1?1:ease(u), porta=PORTE[0];
+      DISCO.visible=u>0; DISCO.scale.set(Math.max(.001,e),1,Math.max(.001,e));     // il dischetto si allarga con la porta
       // la porta la muove anche un'altra buca: se dall'ultima scrittura qualcuno l'ha spostata, resta a lui
       if(scritto===null || Math.abs(porta.rotation.y-scritto)<1e-9){ porta.rotation.y=-PHI*e; scritto=porta.rotation.y; }
       if(u<=0) scritto=null;
@@ -7153,8 +7278,12 @@ BUCHE[2]=(()=>{
    cordolo, fanno lo spartitraffico di una strada a U: l'isola tocca il
    bordo della vetrata (est) e la curva gira attorno alla testata ovest,
    davanti al maxischermo. Tee sul lato finestre, buca sul lato porte.
-   - Percorso regolare: corsia finestre verso ovest, curva (emblema),
-     corsia porte verso est. La mezzeria bianca tratteggiata lo disegna.
+   - Percorso regolare: corsia finestre verso ovest, curva, corsia porte
+     verso est. La mezzeria bianca tratteggiata lo disegna.
+   - Gettone della skill: nel tombino della corsia finestre, mezzo metro
+     oltre la linea d'arresto, sulla linea del primo tiro lungo la strada
+     (1,8 m dal tee): chi segue la strada lo prende senza colpi in più, chi
+     taglia dal passaggio pedonale lo lascia lì (rischio/premio).
    - Scorciatoia: il passaggio pedonale tra le due isole (luce 26 cm,
      lungo 1,56 m), con i cordoli zebrati ambra/bianco, i paletti alle
      bocche e le strisce pedonali ambra davanti alla bocca nord. La buca sta
@@ -7176,6 +7305,8 @@ BUCHE[2]=(()=>{
      2,2-2,9   spuntano i cordoli (elastico), poi i paletti del varco
      2,3-4,25  piroetta della girevole, avanti e indietro: 6 strisce (sssh),
                poi su per la linea d'arresto, che si disegna dietro di lei
+     3,35-3,8  il tombino si posa sulla corsia finestre (clonk); dal tombino
+               spunta il gettone (lo fa spuntare il cambio buca, a 3,8 s)
      4,25-4,85 inchioda, si inclina e torna su; mezzo giro di sedile, cigolio
      4,2-5,4   la telecamera scende dietro la pallina
    La firma parte da qualunque disposizione (dal menu si può arrivare da ogni
@@ -7216,7 +7347,9 @@ BUCHE[2]=(()=>{
        c'è) e resterebbe dietro la schiena della mascotte: resta alta;
      - il caddy non aspetta mai dentro un'isola, su una sedia, sulla girevole
        o contro una parete: se il posto dato dal gioco non è libero ne prende
-       uno libero vicino alla pallina (prima a sinistra, poi a destra).
+       uno libero vicino alla pallina (prima a sinistra, poi a destra);
+     - preso il gettone, il coperchio del tombino fa un quarto di giro e
+       tintinna (solo scena).
    ===================================================================== */
 BUCHE[3]=(()=>{
   const PI=Math.PI;
@@ -7229,7 +7362,13 @@ BUCHE[3]=(()=>{
   const ZN=ZI+HD, ZS=ZI-HD;                                // facce esterne nord (finestre) e sud (porte)
   const TAV={tavoloOvest:{x:CXW, z:ZI, ry:0}, tavoloEst:{x:CXE, z:ZI, ry:0}};
   const TAVF={tavoloOvest:Object.assign({},TAV.tavoloOvest), tavoloEst:Object.assign({},TAV.tavoloEst)};   // pose d'arrivo (ry 0 o pi greco)
-  const TEE={x:1.85, z:1.6}, BUCA={x:XV, z:-1.7}, EMB={x:-6.2, z:.55};
+  const TEE={x:1.85, z:1.6}, BUCA={x:XV, z:-1.7};
+  // gettone della skill nel tombino della corsia finestre, sulla linea del primo tiro lungo la strada (dal tee verso
+  // la curva, 1,8 m): con la mira di un ragazzo (+-4 gradi) lo si prende 3 volte su 4 senza colpi in più. Mezzo metro
+  // oltre la linea d'arresto: la girevole che la percorre nella firma (ruote a 31 cm dal centro) non tocca né il
+  // tombino né la moneta; il tombino (raggio R_TOMB) non tocca il primo trattino della mezzeria oltre la linea. Chi
+  // taglia dal passaggio pedonale non ci passa: rischio/premio.
+  const EMB={x:.05, z:1.62}, R_TOMB=.11;
   // ---------- segnaletica orizzontale ----------
   const STR={n:6, L:.6, w:.13, passo:.27, z0:ZN+.4};       // strisce pedonali davanti alla bocca nord (j=0 vicino all'isola)
   const zStr=j=>STR.z0+j*STR.passo;
@@ -7241,7 +7380,7 @@ BUCHE[3]=(()=>{
   const Y_V=.0058;                                         // vernice: 2 mm sopra l'erba (y .004) + polygonOffset
   // ---------- tempi della firma ----------
   const D=5.4, T_MEZ=[1.4,2.8], T_PIR=2.3, T_STR=2.75, D_STR=.155, P_STR=.18,
-        T_LIN=3.95, D_LIN=.3, T_FRENA=T_LIN+D_LIN, T_GIRO=4.5;
+        T_LIN=3.95, D_LIN=.3, T_FRENA=T_LIN+D_LIN, T_GIRO=4.5, T_TOMB=3.35;
   const CAM_LARGA=[V(6.3,3.25,1.6),V(-1.5,0,-.6)];         // alta sopra il parcheggio nord-est: tutta l'aula, frecce sugli schermi
   const CAM_BASSA=[V(-.55,.95,1.0),V(1.0,.05,1.75)];       // bassa sulla corsia finestre: strisce, linea d'arresto, girevole
   // ---------- dove vanno le 28 sedie ----------
@@ -7805,6 +7944,22 @@ BUCHE[3]=(()=>{
     }
     return out;
   }
+  // coperchio del tombino: ghisa con la cornice, i tasselli a rilievo e due asole (canvas, vista dall'alto)
+  function texTombino(){
+    const c=mkCanvas(256,256), g=c.getContext('2d'), C=128;
+    g.fillStyle='#3f444a'; g.fillRect(0,0,256,256);
+    g.save(); g.beginPath(); g.arc(C,C,112,0,7); g.clip();
+    for(let y=-6;y<=6;y++) for(let x=-6;x<=6;x++){ const px=C+x*19-7, py=C+y*19-7;
+      g.fillStyle='#5a6067'; rRect(g,px,py,14,14,3); g.fill();
+      g.fillStyle='#737a82'; g.fillRect(px+2,py+2,10,3); }
+    g.restore();
+    g.lineWidth=12; g.strokeStyle='#626870'; g.beginPath(); g.arc(C,C,117,0,7); g.stroke();
+    g.lineWidth=3; g.strokeStyle='#2c3035'; g.beginPath(); g.arc(C,C,109,0,7); g.stroke();
+    g.fillStyle='#4a4f56'; g.beginPath(); g.arc(C,C,34,0,7); g.fill();
+    g.lineWidth=4; g.strokeStyle='#7b828a'; g.beginPath(); g.arc(C,C,34,0,7); g.stroke();
+    g.fillStyle='#1d2024'; for(const s of [-1,1]){ rRect(g,C+s*58-13,C-5,26,10,5); g.fill(); }
+    return tex(c);
+  }
   function texChevron(dir){
     const c=mkCanvas(128,80), g=c.getContext('2d');
     g.fillStyle='rgba(14,13,20,.8)'; rRect(g,3,3,122,74,16); g.fill();
@@ -7843,6 +7998,7 @@ BUCHE[3]=(()=>{
     P.mez.geometry.setDrawRange(0,6*k); P.mez.visible=k>0;
     P.strisce.forEach((m,j)=>{ const u=clamp01((t-T_STR-j*P_STR)/D_STR); m.visible=u>0; m.scale.x=Math.max(1e-4,u); });
     const ul=clamp01((t-T_LIN)/D_LIN); P.linea.visible=ul>0; P.linea.scale.x=Math.max(1e-4,ul);
+    const ut=elastico((t-T_TOMB)/.45); P.tomb.visible=ut>.001; P.tomb.scale.setScalar(Math.max(.001,ut));
   }
   function frecce(S,t){
     let accesa=false; const lampo=((t*2)%1)<.5;
@@ -7865,7 +8021,15 @@ BUCHE[3]=(()=>{
     if(P4) P4.mostra(1);
   }
   // ---------- in gioco: la girevole scalpita col semaforino ambra e inchioda al verde ----------
-  const GIOCO={scal:0};
+  const GIOCO={scal:0, tomb:-1, tomb0:0};
+  // preso il gettone: il coperchio del tombino fa un quarto di giro (con un rimbalzino) e torna fermo
+  function tombinoInGioco(dt){
+    if(GIOCO.tomb<0 || !P4) return;
+    GIOCO.tomb+=dt; const u=clamp01(GIOCO.tomb/.55), c=P4.coperchio;
+    c.rotation.y=GIOCO.tomb0+PI/2*easeOutBack(u);
+    c.position.y=.004*Math.sin(PI*clamp01(GIOCO.tomb/.2));
+    if(u>=1){ c.position.y=0; GIOCO.tomb=-1; }
+  }
   function girevoleInGioco(dt,t){
     const g=ARREDO.girevole, s=g&&g.userData.sopra; if(!s) return;
     const meta=G.fase==='carica'?.35+.65*G.potenza:0;
@@ -7985,6 +8149,12 @@ BUCHE[3]=(()=>{
         m.receiveShadow=true; strisce.push(m); }
       const LL=ZA1-ZA0, linea=add(new THREE.PlaneGeometry(LL,.05).rotateX(-PI/2).translate(LL/2,0,0),mBianca,g,XA,Y_V,ZA0,0,-PI/2,0);
       linea.receiveShadow=true;
+      // --- tombino della skill: telaio e coperchio in ghisa a filo del prato, sopra la vernice (solo scena) ---
+      const tomb=new THREE.Group(); tomb.position.set(EMB.x,Y_V+.0004,EMB.z); g.add(tomb);
+      const ghisa=o=>STD(0xffffff,Object.assign({roughness:.6,metalness:.45,polygonOffset:true,polygonOffsetFactor:-3,polygonOffsetUnits:-3},o));
+      add(new THREE.RingGeometry(R_TOMB-.013,R_TOMB,48).rotateX(-PI/2),ghisa({color:0x60666d}),tomb).receiveShadow=true;
+      const coperchio=add(new THREE.CircleGeometry(R_TOMB-.013,48).rotateX(-PI/2),ghisa({map:texTombino()}),tomb,0,.0002,0);
+      coperchio.receiveShadow=true;
       // --- frecce sugli schermi (figlie dei tavoli: li seguono nella manovra) ---
       const matR=new THREE.MeshBasicMaterial({map:texChevron(1),transparent:true,depthWrite:false,toneMapped:false});
       const matL=new THREE.MeshBasicMaterial({map:texChevron(-1),transparent:true,depthWrite:false,toneMapped:false});
@@ -7995,9 +8165,10 @@ BUCHE[3]=(()=>{
         const up=clamp01((u-.35)/.4); gP.visible=up>0; gP.scale.set(1,Math.max(.001,up),1);
         const k=Math.round(tr.length*clamp01(u*1.25-.1)); mez.geometry.setDrawRange(0,6*k); mez.visible=k>0;
         const us=clamp01(u*1.6-.6); for(const m of strisce.concat([linea])){ m.visible=us>0; m.scale.x=Math.max(1e-4,us); }
+        tomb.visible=us>0; tomb.scale.setScalar(Math.max(1e-3,us));
         if(u>=1 && ARREDO.girevole && ARREDO.girevole.userData.sopra) ARREDO.girevole.userData.sopra.rotation.y=0;
       };
-      P4={g,gC,gP,mez,nTratti:tr.length,strisce,linea,mostra};
+      P4={g,gC,gP,mez,nTratti:tr.length,strisce,linea,tomb,coperchio,mostra};
       return {gruppo:g, mostra};
     } },
     firma:{
@@ -8015,7 +8186,7 @@ BUCHE[3]=(()=>{
         S.gir=pianificaGirevole(S,T,parti,TV);
         S.sedie=pianificaSedie(S,T,parti,TV);
         const s=ARREDO.girevole.userData.sopra; S.s0=s?s.rotation.y:0;
-        GIOCO.scal=0; CAMV.attiva=false; CAMI.attiva=false;
+        GIOCO.scal=0; GIOCO.tomb=-1; CAMV.attiva=false; CAMI.attiva=false;
         T.b4=S;
       },
       stato(T,t){
@@ -8033,6 +8204,7 @@ BUCHE[3]=(()=>{
         for(let k=0;k<STR.n;k++) una(S,'s'+k,t,T_STR+k*P_STR,()=>rumore(.22,.04,900));
         una(S,'lin',t,T_LIN,()=>rumore(.3,.045,1100));
         una(S,'fr',t,T_FRENA,()=>{ tono(1100,.12,'sine',.05,0,800); rumore(.08,.035,2600); });
+        una(S,'tomb',t,T_TOMB+.12,()=>{ tono(230,.07,'triangle',.07,0,170); tono(1700,.05,'sine',.025,.03); });
         una(S,'cig',t,T_GIRO+.05,()=>{ tono(900,.12,'triangle',.04,0,1300); tono(1250,.1,'triangle',.03,.13,950); });
       },
       // larga dall'angolo (salti della bandierina, manovra), poi bassa sulle strisce; l'ultimo 1,2 s la porta il gioco
@@ -8045,15 +8217,18 @@ BUCHE[3]=(()=>{
     // pallina ferma nel varco: la mira parte verso la buca (fuori dal corridoio la telecamera non ci sta)
     evento(e){
       if(e.tipo==='fermo' && G.p && nelVarco(G.p.x,G.p.z)){ G.mira=Math.atan2(BUCA.z-G.p.z,BUCA.x-G.p.x); G.camAng=G.mira; }
+      if(e.tipo==='trigger' && e.id==='emblema' && !G.emblema && P4){                 // il coperchio tintinna e gira
+        GIOCO.tomb=0; GIOCO.tomb0=P4.coperchio.rotation.y; tono(1450,.05,'triangle',.05); tono(1950,.07,'triangle',.035,.06); }
     },
     ogniFrame(dt,t){
       if(G.fase==='transizione') return;
       girevoleInGioco(dt,t);
+      tombinoInGioco(dt);
       cameraVarco(dt);
       cameraIsole(dt);
       sistemaCaddy();
     },
-    esci(){ girevoleFerma(); CAMV.attiva=false; CAMI.attiva=false; for(const id in FRECCE){ FRECCE[id].R.visible=false; FRECCE[id].L.visible=false; } }
+    esci(){ girevoleFerma(); if(GIOCO.tomb>=0 && P4){ P4.coperchio.position.y=0; GIOCO.tomb=-1; } CAMV.attiva=false; CAMI.attiva=false; for(const id in FRECCE){ FRECCE[id].R.visible=false; FRECCE[id].L.visible=false; } }
   };
 })();
 
@@ -8071,8 +8246,11 @@ BUCHE[3]=(()=>{
 // tavolo); la loro superficie è campionata da FISICA.terreno, quindi quota e pendenza viste coincidono con
 // quelle vere (la grafica sta 5,5 mm sopra, come l'erba sta 4 mm sopra il pavimento). La testata libera è un
 // gradino più alto del raggio della pallina: in fisica è un bordo (segmento) su cui la pallina rimbalza.
-// Emblema: a metà pista, oltre la seconda canalina, nascosto sotto i banchi proprio dove i due tavoloni si
-// agganciano (galleria tra le gambe delle sedie): prenderlo costa circa un colpo.
+// Emblema: sul percorso ovvio. Dal tee la bandierina non si vede (la copre la testata), quindi il primo tiro
+// naturale è dritto lungo la corsia, parallelo ai banchi, verso la curva in fondo. L'emblema è acquattato a
+// ridosso della prima canalina, proprio su quella linea (z del tee, 1,72 m davanti alla pallina): chi tira
+// dritto lo prende al primo colpo, senza colpi extra; chi tira storto (verso le sedie o i radiatori) lo salta.
+// Modello "ragazzo" (mira ±4°, potenza ±8%, 200 partite): emblema nel 81% delle partite.
 // La mazza Drin è solo estetica: nessun potere, la fisica è quella comune.
 // Firma "Fine lezione, semaforo e giro di pista" (6 s, funzione di t, saltabile in ogni istante):
 //   0-0,95 s   la camera scende a 30 cm sul tee (ad arco se parte lontano o oltre i banchi). Le sedie vicine
@@ -8085,9 +8263,10 @@ BUCHE[3]=(()=>{
 //              con i solidi veri (vedi "arredi in funzione di t"): nessun arredo ne attraversa un altro.
 //   1,3/1,6/1,9 s  le prime tre coppie di pannelli si riaccendono ambra, dal tee verso la buca (bip)
 //   2,2 s      bip più acuto: tutte bianche e più brillanti, via. Giro di pista a 30 cm (FOV 62 -> 70) lungo una
-//              curva Catmull-Rom: le canaline si srotolano 1,5 m davanti alla camera (tump), l'emblema spunta
-//              sotto i banchi oltre la seconda; la camera scavalca con un saltello mascotte e caddy che
-//              corrono al tee; in fondo piega dietro la testata e la quinta si srotola davanti alla bandierina
+//              curva Catmull-Rom: al via l'emblema spunta davanti alla prima canalina, sulla linea del tee (la
+//              camera gli dà un'occhiata e lo scavalca con un saltello, come mascotte e caddy che corrono al
+//              tee); le canaline si srotolano 1,5 m davanti alla camera (tump); in fondo piega dietro la
+//              testata e la quinta si srotola davanti alla bandierina
 //   4,1-4,25 s arriva al traguardo: la bandierina si piega via dalla camera e torna su con l'elastico
 //   4,25-6 s   gru: sale guardando la bandierina, poi arretra in volo sopra i dossi in fila verso il tee e
 //              scende dietro la pallina (raccordo comune)
@@ -8101,7 +8280,7 @@ BUCHE[4]=(()=>{
   // sedie infilate: la seduta va sotto il piano, lo schienale (davanti a 14 cm dal centro sopra quota 0,72)
   // resta 2,5 cm fuori dal bordo del piano (bordi a Z_TAV ± 0,70)
   const Z_SF=Z_TAV+.585, Z_SP=Z_TAV-.58;
-  const TEE={x:-5.6,z:1.75}, BUCA={x:6.25,z:.25}, EMB={x:-.42,z:.25};
+  const TEE={x:-5.6,z:1.75}, BUCA={x:6.25,z:.25}, EMB={x:-3.88,z:1.75};   // emblema: sulla linea del tee, prima della 1a canalina
   const CAN_W=.30, CAN_Y0=.0055, Z_CAN=Z_SF+.245+.035, Z_FIN=AULA.zF-.05, X_VET=AULA.x1-.05;
   // canaline: ancora (a, contro la parete: il rotolo parte da lì) -> estremo libero (b), quota del dosso
   const CAN=[
@@ -8249,17 +8428,19 @@ BUCHE[4]=(()=>{
     if(u<D-td) return vm*(ta/2+u-ta);
     const r=D-u; return 1-.5*vm*r*r/td;
   }
-  // la camera corre a 30 cm: se incrocia la mascotte o il caddy che corrono al tee, li scavalca con un saltello
+  // la camera corre a 30 cm: se incrocia la mascotte o il caddy che corrono al tee, li scavalca con un saltello;
+  // un saltello più piccolo per la moneta dell'emblema (la corsa le passa accanto, 10 cm più in là)
   function salto(p){
     let h=0;
     for(const o of [G.M&&G.M.root, G.C&&G.C.root]) if(o && o.visible){
       const d=Math.hypot(p.x-o.position.x,p.z-o.position.z); h=Math.max(h,.34*Math.pow(clamp01(1-d/.8),.6)); }
+    if(gEmblema.visible){ const d=Math.hypot(p.x-EMB.x,p.z-EMB.z); h=Math.max(h,.15*Math.pow(clamp01(1-d/.6),.6)); }
     return h;
   }
   function tempoU(u){ let a=T5.corsa[0], b=T5.corsa[1]; if(u<=0) return a; for(let i=0;i<40;i++){ const m=(a+b)/2; if(sCorsa(m)<u) a=m; else b=m; } return (a+b)/2; }
   // istanti calcolati una volta sola dalla curva: srotolamento di ogni canalina (quando la camera è 1,5 m prima
-  // di attraversarla; la quinta 2,7 m, così si vede davanti alla bandierina), emblema (3,6 m prima), bandierina
-  // (la camera arriva a 0,95 m)
+  // di attraversarla; la quinta 2,7 m, così si vede davanti alla bandierina), bandierina (la camera arriva a
+  // 0,95 m). L'emblema spunta al via: è 2,3 m davanti alla camera ferma sul tee, che poi gli corre accanto
   let TC=null, T_EMB=0, T_BAND=0;
   function tempiCorsa(){
     if(TC) return;
@@ -8268,7 +8449,7 @@ BUCHE[4]=(()=>{
       for(let i=1;i<=N;i++) if(d(pts[i-1])*d(pts[i])<=0) return i/N;
       return 0; });
     TC=uX.map((u,k)=>tempoU(u-T5.anticipo[k]/L_CORSA));
-    const iE=pts.findIndex(p=>p.x>=EMB.x-3.6); T_EMB=tempoU(Math.max(0,iE)/N);   // spunta 3,6 m davanti alla camera
+    T_EMB=T5.via;                                               // l'emblema spunta al via
     const iB=pts.findIndex(p=>Math.hypot(p.x-BUCA.x,p.z-BUCA.z)<.95); T_BAND=tempoU(Math.max(0,iB)/N);   // la camera arriva al traguardo
   }
 
@@ -8737,7 +8918,7 @@ BUCHE[4]=(()=>{
       const D=this.durata;
       if(RIDOTTO) return null;
       if(t>=D){ camera.fov=62; camera.updateProjectionMatrix(); gFlag.rotation.set(0,0,0); return null; }
-      // l'emblema spunta sotto i banchi oltre la seconda canalina mentre passa la camera (statoTransizione lo ha appena posato)
+      // al via l'emblema spunta davanti alla prima canalina, sulla linea del tee (statoTransizione lo ha appena posato)
       const ue=elastico((t-T_EMB)/.55); gEmblema.visible=ue>.01; gEmblema.scale.setScalar(Math.max(.001,ue));
       // al traguardo la bandierina si piega via dalla camera che arriva da nord (verso -z) e torna su con l'elastico
       const kb=t<T_BAND?0:ease(clamp01((t-T_BAND)/.14))*(1-elastico((t-T_BAND-.14)/1.15));
@@ -8756,7 +8937,7 @@ BUCHE[4]=(()=>{
         pos=CORSA.getPointAt(u); pos.y+=.004*Math.sin(t*31)+salto(pos);
         const avanti=pos.clone().addScaledVector(CORSA.getTangentAt(Math.min(1,u+.06)),2.4); avanti.y=.15;
         const w=ease(clamp01((t-T5.via)/.3)), wb=ease(clamp01((pos.x-3.4)/2.2));
-        const we=.4*Math.sin(Math.PI*clamp01((t-T_EMB+.05)/.6));     // un'occhiata alla moneta che spunta sotto i banchi
+        const we=.35*Math.sin(Math.PI*clamp01((t-T_EMB)/.5));        // un'occhiata alla moneta che spunta davanti alla prima canalina
         look=L0.clone().lerp(avanti,w).lerp(EMB_LOOK,we).lerp(FLAG_LOOK,wb);
       } else {                                                 // gru: sale, si volta verso il traguardo e torna indietro sopra i dossi
         const u=ease(clamp01((t-T5.corsa[1])/(D-T5.corsa[1])));
@@ -8830,54 +9011,58 @@ BUCHE[4]=(()=>{
 
 BUCHE[5]=(()=>{
   /* =====================================================================
-     BUCA 6 — CREATIVITA' — "Il piano di sopra" · mazza: il Pennellone · par 3
-     Il tavolone est scivola al centro dell'aula e diventa una piattaforma (liv 1, quota
-     H_TAV): la buca e' sul piano, tra gli iMac, in un tappetino d'erba. Ci si sale da una
-     rampa stampata in 3D a strati arcobaleno (la tavolozza del vaso del bancone, senza
-     rosso) attaccata al lato corto est. L'emblema e' sotto lo stesso tavolo, all'imbocco
-     della galleria, sotto il bordo del piano tra le gambe di una sedia infilata.
-     Tarata con il solutore e con una mappa angolo x potenza degli esiti dal tee (collaudo:
-     passi di 1 grado e del 5%):
-     - tee in linea con la sponda esterna della rampa (z +0,70). Tiro dritto (-180/-179 gradi,
-       potenza >= 65%): rasenta la sponda, passa oltre il pannello del tavolo e corre sotto
-       il bordo del piano, sull'emblema. Rampa: da -175 a -160 gradi con potenza 85-100%
-       (le sponde tengono la pallina sulla rampa). La buca dal tee e' a -174 gradi, sul bordo
-       sinistro della finestra: la mira iniziale va a -170,5 gradi (MIRA0, solo la direzione).
-     - rampa 2,6 m in pianta (16 gradi): con V_MAX 5,6 e MU 0,11 la soglia dipende da
-       quota + attrito (10,65 + 2,16*(tratto) m2/s2), la rampa corta allarga la finestra.
-     - sul piano: piedi degli iMac, tastiere con il mouse e maglie piegate sono ostacoli
-       (liv 1); lo schermo sta 8 cm sopra il piano e la pallina ci passa sotto. Sponde
-       stampate (3 cm) sui lati lunghi e sul lato della rampa: senza, quasi meta' dei tiri
-       riusciti cadeva dal bordo dopo un rimbalzo sugli iMac (47 su 119 nella mappa). Il
-       lato ovest resta aperto: da li' si cade sull'erba.
-     - ballatoi esterni a filo del piano (17 cm): la mascotte sta 15 cm a sinistra della
-       pallina e con la pallina contro la sponda finirebbe fuori dal piano, a terra sotto
-       il tavolo. La piattaforma fisica li comprende (FISICA.dentroRett decide la quota
-       della mascotte); la pallina non li raggiunge mai (sponde), quindi per lei il piano
-       fisico coincide con quello disegnato.
-     - solutore: buca in 2 colpi (par 3); emblema al primo colpo; con l'emblema si esce
-       dalla galleria, si risale e si imbuca: 4 colpi, uno sopra il par.
-     Coppa sul tavolo: maschera stencil di gBuca + piano (matLacca, solo durante la buca)
-     e tappetino con il test NotEqual come matErba. La coppa sporge 7,5 cm sotto il piano:
-     la avvolge un barattolo di tempera appeso sotto il tavolo (si vede dalla galleria).
-     Firma "La stampante 3D stampa la rampa" (5,6 s, funzione di t, saltabile): i tavoloni
-     viaggiano con le loro sedie (vedi "coreografia degli arredi"), la girevole vola; la
-     stampante del bancone si sveglia (carrello, bobina, tre bip), un filo nel colore
-     della Casa raggiunge un ugello gigante (alto, sopra gli schermi, finche' il tavolone non
-     e' arrivato) che traccia lo skirt e stampa la rampa a strati di 2 cm (clipping plane SOLO
-     in stampa; lo strato appena deposto ha il bordo ambra), con le sponde e i ballatoi del
-     piano negli ultimi strati; poi si srotola il tappetino, la bandierina risale la rampa a
-     saltelli e il foro si apre a diaframma. Il cuneo della rampa coincide con la FISICA al
-     decimo di millimetro (bevel di ExtrudeGeometry invertito).
+     BUCA 6 — CREATIVITA' — "Il ponte sospeso" · mazza: il Pennellone · par 4
+     Percorso sospeso: dal prato si sale sul tavolone est (piattaforma, liv 1, quota H_TAV)
+     dalla rampa stampata in 3D a strati arcobaleno (la tavolozza del vaso del bancone, senza
+     rosso), si attraversa il ponte sospeso che parte dal ballatoio lato porte e sale al
+     bancone della stampante 3D (piattaforma inclinata, da 0,76 a 0,90 in 1,5 m), la buca e'
+     sul bancone, in un tappetino d'erba accanto alla stampante, in linea con il ponte.
+     Fisica (blocco FISICA): tavolone, ponte (h -> h2 lungo il lato lungo) e bancone sono tre
+     piattaforme; uscendo da una si passa sull'altra perche' al bordo la quota coincide. Il
+     bancone dell'aula (segmenti senza liv) qui vale solo a terra: in alto lo chiudono parete,
+     bussole e la sponda stampata. I ballatoi davanti al bancone (17 cm, a filo del piano) sono
+     piattaforme solo per la mascotte, che sta 15 cm accanto alla pallina: la pallina non li
+     raggiunge (sponde), la mascotte non finisce a terra (passoFrame: FISICA.piattaformaDi).
+     - Sul tavolone niente tastiere, mouse e maglie (mesh unite: affondano nel piano all'inizio
+       della firma, via anche dalla fisica; tornano in esci()). Gli iMac restano: nel campo tra
+       rampa e ponte ci sono i piedi del 7o davanti e del 7o dietro, da aggirare. Un fermapalla
+       stampato di traverso (x 0,85, tra gli iMac) chiude il campo: i tiri lunghi non si perdono
+       tra gli iMac di fondo (modello "ragazzo": senza fermapalla 4,95 colpi e 17 palline
+       raccolte su 200; con il fermapalla 3,95 e 1).
+     - Ponte: impalcato largo 50 cm (assi stampate nel colore della Casa), corsia di 22 cm tra
+       due sponde stampate (3 cm, come quelle del tavolo): la pallina non cade dal ponte; ai
+       lati la mascotte cammina sulle assi. Funi portanti e pendini oscillano appena (solo
+       grafica: la fisica non cambia), di piu' quando la pallina e' sul ponte.
+     - Gettone della skill a meta' del ponte (piattaforma P6): sul percorso obbligato.
+     - Tarata con il solutore (buca in 2: dal tee sul tavolo o sul ponte, poi giu' dal ponte
+       in buca) e con il modello "ragazzo" (rampa con la mira del gioco, poi l'imbocco del
+       ponte o la bandierina se si vede; +-4 gradi, +-8% di potenza, 200 partite, tre semi):
+       3,95-4,26 colpi in media, in buca 196-199 su 200, gettone 99-100% senza colpi in piu'.
+       Par 4. risolviEmblema(5) da' null: dal tee la pallina arriva al massimo all'inizio del ponte.
+     - tee e mira iniziale come prima: la rampa da -175 a -160 gradi, potenza >= 83%.
+     Coppa sul bancone: la maschera stencil di gBuca + tappetino (NotEqual come matErba) +
+     copie del piano e del mobile del bancone con lo stesso test (gli originali si nascondono:
+     matLegnoChiaro e' condiviso e non si tocca). Le copie si usano solo con la telecamera
+     sopra il piano: da sotto la maschera cadrebbe sul fronte del bancone (fessura).
+     Firma "La stampante 3D stampa la rampa e il ponte" (6 s, funzione di t, saltabile): i
+     tavoloni viaggiano con le loro sedie (vedi "coreografia degli arredi"), la girevole vola;
+     la stampante del bancone si sveglia (carrello, bobina, tre bip), un filo nel colore della
+     Casa raggiunge un ugello gigante che traccia lo skirt e stampa la rampa a strati di 2 cm
+     (clipping plane SOLO in stampa; lo strato appena deposto ha il bordo ambra), con sponde,
+     fermapalla e ballatoi del piano negli ultimi strati; poi corre lungo il ponte deponendo
+     le assi una dopo l'altra (le funi si tendono dietro di lui), chiude con la sponda e i
+     ballatoi del bancone; si srotola il tappetino, la bandierina risale la rampa, attraversa
+     il ponte a saltelli e il foro si apre a diaframma. Il cuneo della rampa coincide con la
+     FISICA al decimo di millimetro (bevel di ExtrudeGeometry invertito).
      Potere SCIA (informativo, la fisica non cambia): ogni tiro lascia una pennellata del
-     colore del colpo (coloreColpo() del Pennellone) su erba, rampa e piano. Un unico
-     nastro BufferGeometry preallocato con drawRange; quota = FISICA.terreno + spessore
-     della superficie che si vede (erba 4 mm, tappetini) + 2 mm. Resta per tutta la buca,
-     si azzera con la pallina nuova (preparaBuca) e si cancella in esci().
+     colore del colpo (coloreColpo() del Pennellone) su erba, rampa, piano, ponte e bancone.
+     Un unico nastro BufferGeometry preallocato con drawRange; quota = FISICA.terreno +
+     spessore della superficie che si vede (erba 4 mm, tappetini) + 2 mm. Resta per tutta la
+     buca, si azzera con la pallina nuova (preparaBuca) e si cancella in esci().
      ===================================================================== */
   const PI=Math.PI;
   // ---------- misure (metri, sistema dell'aula) ----------
-  const ID='T6';
+  const ID='T6', IDP='P6', IDB='B6';
   const XT=-.8, ZT=0;                                   // tavolone est al centro (ry 0): piano x -3,6..+2,0
   const RL=2.6, RW0=.1, RW1=.645, SP=.012, HS=.03;      // rampa: lunghezza in pianta, bordi (z), sponde (spessore, altezza)
   const X_TOP=XT+L_TAV/2, X_BASE=X_TOP+RL, RW=RW1-RW0, RZ=ZT+(RW0+RW1)/2, PEND=H_TAV/RL;
@@ -8885,40 +9070,42 @@ BUCHE[5]=(()=>{
   const SB=.012, ALA=.17, SA=.016;                      // sponde del piano (spessore, alte HS); ballatoi (larghezza, spessore)
   const ZS=.745;                                        // sedie infilate: schienale fuori dal ballatoio
   const HMAX=H_TAV+HS;                                  // ultimo strato stampato (cima di sponde e cornice)
+  const XF=.85;                                         // fermapalla di traverso sul piano (faccia est), tra gli iMac
+  // bancone (piano a 0,90, z -3,0..-2,37) e ponte: dal bordo del ballatoio del tavolone al bordo del bancone
+  const BAN=AULA.bancone, HB=BAN.h, BX0=BAN.x0-.02, BX1=BAN.x1+.02, ZB=AULA.zP+BAN.prof+.03;
+  const XP=1.75, CW=.11, DW=.25;                        // asse del ponte; mezza corsia tra le sponde; mezzo impalcato
+  const ZP0=ZT-P_TAV/2-ALA, ZP1=ZB, LP=ZP0-ZP1, PP=(HB-H_TAV)/LP;   // ponte z -0,87..-2,37: sale di 14 cm (9,3%)
+  const quotaPonte=z=>H_TAV+PP*Math.max(0,Math.min(LP,ZP0-z));
   const TEE={x:X_BASE+1.0, z:ZT+.70};
   const MIRA0=-170.5*PI/180;                            // mira iniziale dal tee: dentro la finestra della rampa
-  const BUCA={x:XT+1.51, z:ZT+.19, liv:1, plat:ID};     // tra il 6o e il 7o iMac davanti, di fronte al 6o di dietro
-  const EMB={x:XT+2.3, z:ZT+.655};                      // sotto il bordo del piano, oltre il pannello
+  const BUCA={x:XP, z:-2.68, liv:1, plat:IDB};          // sul bancone, in linea con il ponte, accanto alla stampante
+  const EMB={x:XP, z:(ZP0+ZP1)/2, liv:1, plat:IDP};     // a meta' del ponte
   const XO=-5.45, ZO=-.06;                              // tavolone ovest di traverso in fondo all'aula (6 cm verso le porte:
                                                         // la tastiera del docente resta 4 cm fuori dal radiatore)
-  const MAT={x:BUCA.x, z:ZT+.22, w:.5, d:.38};          // tappetino d'erba sul piano (tra piedi e tastiere)
-  // ostacoli del piano (liv 1), coordinate locali del tavolone est: [cx,cz,w,d,ry]
+  const MAT={x:BUCA.x, z:BUCA.z, w:.5, d:.42};          // tappetino d'erba sul bancone
+  // piedi degli iMac (liv 1), coordinate locali del tavolone est: [cx,cz,w,d,ry]. Tastiere, mouse e maglie: via
   const OST=[];
-  for(let i=0;i<7;i++) for(const [x0,dz,s] of [[-2.34+i*.7,.19,1],[-1.98+i*.7,-.19,-1]]){
-    OST.push([x0,dz-s*.0265,.144,.207,0]);              // piede dell'iMac (lamiera piegata)
-    OST.push([x0+s*.04,dz+s*.30425,.359,.1235,0]);      // tastiera e mouse
-  }
-  OST.push([-.41,.46,.15,.1,.3],[-1.81,-.46,.15,.1,-.3],[.99,-.46,.15,.1,-.3]);   // maglie piegate
+  for(let i=0;i<7;i++) for(const [x0,dz,s] of [[-2.34+i*.7,.19,1],[-1.98+i*.7,-.19,-1]]) OST.push([x0,dz-s*.0265,.144,.207,0]);
   // ---------- firma: tempi (s) ----------
-  const DURATA=5.6;
-  const TL={sveglia:.2, filo0:.6, filo1:1.0, chiude:1.08, scende0:.9, skirt0:1.1, skirt1:1.4, strati0:1.4, strati1:3.75,
-            ritira0:3.75, ritira1:4.15, salita0:3.9, salita1:4.65, tappeto0:3.95, tappeto1:4.5, apre:4.65};
-  const BAN=AULA.bancone, XS=BAN.x0+.95, YS=BAN.h, ZSt=AULA.zP+.3;   // stampante 3D del bancone (come nella scena)
+  const DURATA=6.0;
+  const TL={sveglia:.2, filo0:.6, filo1:1.0, chiude:1.08, scende0:.9, skirt0:1.1, skirt1:1.4, strati0:1.4, strati1:3.2,
+            ponte0:3.2, ponte1:4.2, ritira0:4.2, ritira1:4.55, salita0:4.3, salita1:5.3, tappeto0:4.25, tappeto1:4.75, apre:5.3};
+  const BANP=AULA.bancone, XS=BANP.x0+.95, YS=BANP.h, ZSt=AULA.zP+.3;   // stampante 3D del bancone (come nella scena)
   const COLORI_RAMPA=['#f07818','#f5c518','#8bc32a','#2c8ac0','#7b3fd4'];   // il vaso stampato, senza la fascia rossa
   const TAV_RIPIEGO=[0xf2b630,0x3cc8d0,0x8a5cd0,0x5aa8f0,0xf08a24];        // se la mazza non da' il colore del colpo
   const ATTESA={x:X_BASE+.35, z:RZ-.45};                // la bandierina aspetta qui la fine della stampa
   const CAM=[[1.0,[4.6,2.05,2.45],[1.6,.62,-1.15]], [2.4,[5.25,1.5,2.05],[2.7,.42,-.25]],
-             [3.6,[4.05,1.5,1.75],[1.5,.55,.05]], [4.4,[2.75,1.62,1.35],[.95,.74,.12]]];
+             [3.3,[4.35,1.75,.95],[1.9,.72,-1.0]], [4.2,[3.55,1.7,-.25],[1.65,.84,-2.15]], [5.0,[3.1,1.62,-.75],[1.8,.86,-2.55]]];
   const mix=(a,b,k)=>{ const c=s=>Math.round((a>>s&255)*(1-k)+(b>>s&255)*k); return (c(16)<<16)|(c(8)<<8)|c(0); };
   const tintaCasa=k=>mix((PALETTE[G.casa]||PALETTE.quercia).tunica,0xffffff,k);
-  const S={flagFin:null, quadro:false, fs:1, clipPrima:null, pRif:null, cam:null};
+  const S={flagFin:null, quadro:false, fs:1, clipPrima:null, pRif:null, cam:null, emb:false};
   let PR=null;
 
   function disponi(){
-    const m={tavoloEst:{x:XT,z:ZT,ry:0}, tavoloOvest:{x:XO,z:ZO,ry:-PI/2}, girevole:{x:1.05,z:-1.95,ry:PI}};
+    const m={tavoloEst:{x:XT,z:ZT,ry:0}, tavoloOvest:{x:XO,z:ZO,ry:-PI/2}, girevole:{x:.4,z:-1.62,ry:PI}};   // girevole: fuori dal ponte
     for(let k=0;k<7;k++){
       const x=XT-2.1+k*.7;
-      m['sediaEP'+k]={x, z:ZT-ZS, ry:0};                // infilate sotto il piano: le gambe fanno la galleria
+      m['sediaEP'+k]={x:k===6?x-.15:x, z:ZT-ZS, ry:0};  // infilate sotto il piano; la settima lascia posto al ponte
       m['sediaEF'+k]={x, z:ZT+ZS, ry:PI};
       // tavolone ovest: le sedie restano lungo il tavolo nello stesso ordine del laboratorio (la 0 verso la testata
       // del docente, che finisce dal lato delle finestre): nella firma scorrono lungo il lato senza incrociarsi
@@ -8929,26 +9116,43 @@ BUCHE[5]=(()=>{
   }
   function mondo(m){
     m.piattaforme.push({id:ID, cx:XT, cz:ZT, w:L_TAV, d:P_TAV+2*ALA, ry:0, h:H_TAV});
+    m.piattaforme.push({id:IDP, cx:XP, cz:(ZP0+ZP1)/2, w:LP, d:2*DW, ry:PI/2, h:H_TAV, h2:HB});   // lato locale x verso -z
+    m.piattaforme.push({id:IDB, cx:(BX0+BX1)/2, cz:(AULA.zP+ZB)/2, w:BX1-BX0, d:ZB-AULA.zP, ry:0, h:HB});
+    for(const [a,b,k] of [[BX0,XP-DW,'a'],[XP+DW,BX1,'b']]) m.piattaforme.push({id:IDB+k, cx:(a+b)/2, cz:ZB+ALA/2, w:b-a, d:ALA, ry:0, h:HB});
     m.rampe.push({ax:X_BASE, az:RZ, bx:X_TOP, bz:RZ, larghezza:RW, hTop:H_TAV, piattaforma:ID});
+    // il bancone dell'aula (rettangolo senza liv di costruisciMondo) vale solo a terra
+    const inB=(x,z)=>x>BAN.x0-1e-6 && x<BAN.x1+1e-6 && z>AULA.zP-1e-6 && z<AULA.zP+BAN.prof+.05+1e-6;
+    for(const s of m.segmenti) if(s.liv===undefined && inB(s.ax,s.az) && inB(s.bx,s.bz)) s.liv=0;
     // sponde della rampa (liv 0): dal pannello del tavolo alla base, chiudono la tasca sotto il piano
     const x0=X_TOP-.09, cx=(x0+X_BASE)/2;
     for(const zc of [RW0+SP/2, RW1-SP/2]) for(const q of FISICA.rettangolo(cx,ZT+zc,X_BASE-x0,SP,0)){ q.liv=0; m.segmenti.push(q); }
     for(const [x,z,w,d,ry] of OST) for(const q of FISICA.rettangolo(XT+x,ZT+z,w,d,ry)){ q.liv=1; m.segmenti.push(q); }
-    // sponde del piano (liv 1): facce interne. Lato est solo fuori dalla bocca della rampa; lato ovest aperto
+    // sponde (liv 1, facce interne): tavolo (lato porte aperto sul ponte, testata est aperta sulla rampa), fermapalla,
+    // corsia del ponte (dal bordo del piano al bancone), bancone (davanti, aperta sul ponte)
     const sg=(ax,az,bx,bz)=>m.segmenti.push({ax,az,bx,bz,liv:1});
-    const xi=X_TOP-SB, xw=XT-L_TAV/2, zi=P_TAV/2-SB;
-    sg(xi,ZT+zi,xw,ZT+zi); sg(xi,ZT-zi,xw,ZT-zi);
+    const xi=X_TOP-SB, xw=XT-L_TAV/2, zi=P_TAV/2-SB, zs=ZT-zi, zb=ZB-SB;
+    sg(xi,ZT+zi,xw,ZT+zi); sg(xw,zs,XP-CW,zs); sg(XP+CW,zs,xi,zs);
     sg(xi,ZT-zi,xi,ZT+RW0+SP); sg(xi,ZT+RW1-SP,xi,ZT+zi);
+    sg(XF,ZT-zi,XF,ZT+zi);
+    sg(XP-CW,zs,XP-CW,zb); sg(XP+CW,zs,XP+CW,zb);
+    sg(BAN.x0,zb,XP-CW,zb); sg(XP+CW,zb,BAN.x1,zb);
+    // sul bancone: stampante (telaio), vaso stampato, disco nero
+    for(const q of FISICA.rettangolo(XS,ZSt,.46,.44,0)){ q.liv=1; m.segmenti.push(q); }
+    m.cerchi.push({x:BAN.x1-.5, z:AULA.zP+.3, r:.046, liv:1});
+    for(const q of FISICA.rettangolo(BAN.x1-.25,AULA.zP+.25,.13,.03,0)){ q.liv=1; m.segmenti.push(q); }
+    if(m.buca) m.buca.plat=IDB;                          // la buca cattura solo sul bancone
   }
 
   /* ---------- oggetti scenici (creati una volta da propsDi) ---------- */
   function crea(){
     const g=new THREE.Group(); g.name='buca6';
     const tav=ARREDO.tavoli.find(o=>o.userData.id==='tavoloEst');
-    const suTav=new THREE.Group(); suTav.name='buca6_tavolo';   // tappetino, sponde, ballatoi, barattolo: seguono il tavolo
+    const suTav=new THREE.Group(); suTav.name='buca6_tavolo';   // sponde, fermapalla, ballatoi: seguono il tavolo
     tav.add(suTav);
     const _Y=V(0,1,0), _d=V(0,0,0), _a=V(0,0,0), _b=V(0,0,0), _c=new THREE.Color();
     const ottone=PHY(0xd9a441,{metalness:1,roughness:.28,clearcoat:.3});
+    // materiali clonati dopo la linearizzazione della scena: gia' lineari, linearizza() non li deve riconvertire
+    const giaLineare=m=>{ MATS.add(m); return m; };
 
     // ---- materiale stampato: fasce per quota (v = y/H_TAV), una riga di strato ogni 4 mm ----
     const cR=mkCanvas(16,1024), gR=cR.getContext('2d'), cB=mkCanvas(16,1024), gB=cB.getContext('2d');
@@ -8992,12 +9196,16 @@ BUCHE[5]=(()=>{
     const rampa=add(uvQuota(unisci(parti)),matRampa,g,X_TOP,0,RZ); rampa.receiveShadow=true; rampa.castShadow=true; rampa.name='rampa6';
     const ombraR=ombra(g,X_TOP+RL*.45,RZ,RL*.85,RW+.08,.5,true,.0085);
 
-    // ---- sul tavolo: sponde stampate (3 cm), ballatoi con mensole, tappetino, barattolo ----
-    const xE=L_TAV/2, zE=P_TAV/2, rr=.005;               // coordinate locali del tavolone
-    const pb=[pezzo(rbox(L_TAV,HS,SB,rr,2),0,H_TAV+HS/2,zE-SB/2), pezzo(rbox(L_TAV,HS,SB,rr,2),0,H_TAV+HS/2,-(zE-SB/2))];
+    // ---- sul tavolo: sponde stampate (3 cm) aperte sul ponte, fermapalla, imbocco del ponte, ballatoi con mensole ----
+    const xE=L_TAV/2, zE=P_TAV/2, rr=.005, xp=XP-XT;     // coordinate locali del tavolone
+    const pb=[pezzo(rbox(L_TAV,HS,SB,rr,2),0,H_TAV+HS/2,zE-SB/2)];
+    const s1=xp-CW+xE, s2=xE-(xp+CW);                    // lato porte: due tratti ai lati della corsia
+    pb.push(pezzo(rbox(s1,HS,SB,rr,2),-xE+s1/2,H_TAV+HS/2,-(zE-SB/2)), pezzo(rbox(s2,HS,SB,rr,2),xE-s2/2,H_TAV+HS/2,-(zE-SB/2)));
     const lEst1=(RW0-ZT)+(zE-SB), lEst2=(zE-SB)-(RW1-ZT);
     pb.push(pezzo(rbox(SB,HS,lEst1,rr,2),xE-SB/2,H_TAV+HS/2,-(zE-SB)+lEst1/2));
     pb.push(pezzo(rbox(SB,HS,lEst2,rr,2),xE-SB/2,H_TAV+HS/2,(RW1-ZT)+lEst2/2));
+    pb.push(pezzo(rbox(SB,HS,2*(zE-SB),rr,2),XF-XT-SB/2,H_TAV+HS/2,0));                    // fermapalla
+    for(const s of [-1,1]) pb.push(pezzo(rbox(SB,HS,ALA+SB,rr,2),xp+s*(CW+SB/2),H_TAV+HS/2,-(zE-SB+(ALA+SB)/2)));   // imbocco sul ballatoio
     const pa=[];
     for(const s of [-1,1]){
       pa.push(pezzo(rbox(L_TAV,SA,ALA,.006,2),0,H_TAV-SA/2,s*(zE+ALA/2)));
@@ -9010,24 +9218,86 @@ BUCHE[5]=(()=>{
     const matBallClip=matBall.clone(); matBallClip.clippingPlanes=[PIANO]; matBallClip.clipShadows=false;
     const ballatoi=add(uvQuota(unisci(pa)),matBall,suTav); ballatoi.castShadow=true; ballatoi.receiveShadow=true;
     const stampati=[[rampa,matRampa,matClip],[bordi,matRampa,matClip],[ballatoi,matBall,matBallClip]];
-    // tappetino d'erba sul piano: stesso stencil di matErba (la coppa si vede nel foro)
+
+    // ---- il ponte sospeso: assi nel colore della Casa (una mesh per asse: nella firma si depongono una alla volta),
+    //      con i due tratti di sponda della corsia; montanti, funi portanti e pendini ----
+    // Ogni asse e' una mesh nel suo sistema (origine al centro, inclinata come il ponte) con sotto i due tratti di
+    // trave; i due tratti di sponda della corsia sono un'altra mesh con lo stesso sistema: nella firma l'asse si
+    // allunga e la sponda cresce attorno al proprio centro. Colore delle sponde: la fascia alta (viola) del
+    // materiale stampato, uv per quota del mondo (v = quota/H_TAV) come le sponde del tavolo.
+    const NA=16, PA=LP/NA, TA=.018, ANG=Math.atan(PP), cosA=Math.cos(ANG), LA=PA/cosA;
+    const mAsse=PHY(0xffffff,{bumpMap:tB,bumpScale:.0016,roughness:.5,clearcoat:.15,clearcoatRoughness:.4,envMapIntensity:.55});
+    const gAsse=unisci([rbox(2*DW,TA,LA-.016,.004,2)].concat([-1,1].map(s=>pezzo(rbox(.024,.03,LA+.001,.006,2),s*(DW-.035),-TA/2-.015,0))));
+    const uvY=(geo,y0)=>{ const p=geo.attributes.position, u=geo.attributes.uv;
+      for(let i=0;i<p.count;i++) u.setXY(i,p.getX(i)*1.15+p.getZ(i),(p.getY(i)+y0)/H_TAV); return geo; };
+    const assi=[];
+    for(let i=0;i<NA;i++){
+      const zc=ZP0-(i+.5)*PA, yc=quotaPonte(zc), y0=yc-TA/2/cosA;
+      const a=add(gAsse,mAsse,g,XP,y0,zc,ANG,0,0); a.castShadow=true; a.receiveShadow=true;
+      const sp=[-1,1].map(s=>pezzo(rbox(SB,HS,LA+.002,.003,2),s*(CW+SB/2),TA/2+HS/2,0));
+      const ms=add(uvY(unisci(sp),y0),matRampa,g,XP,y0,zc,ANG,0,0); ms.castShadow=true;
+      assi.push([a,ms,zc,yc]);
+    }
+    const HM=.34, MON=[];                                // montanti: sul ballatoio del tavolo e su quello del bancone
+    for(const s of [-1,1]) for(const [z,y] of [[ZP0+.03,H_TAV],[ZB+.035,HB]]) MON.push([XP+s*(DW-.02),y,z]);
+    const [montanti,montantiB]=[H_TAV,HB].map(yy=>{ const pm=[];         // quelli del tavolo e quelli del bancone
+      for(const [x,y,z] of MON.filter(q=>q[1]===yy)){ pm.push(pezzo(rbox(.032,HM,.032,.008,2),x,y+HM/2,z)); pm.push(pezzo(new THREE.SphereGeometry(.024,14,10),x,y+HM+.012,z)); }
+      const m=add(unisci(pm),mAsse,g); m.castShadow=true; return m; });
+    // funi: due portanti (parabola con freccia 18 cm) e i pendini fino al bordo delle assi; oscillazione sui vertici
+    const mFune=STD(0xe9dcc0,{roughness:.85});
+    const fune=(s,u)=>{ const zA=ZP0+.03, zB=ZB+.035, z=zA+(zB-zA)*u, yA=H_TAV+HM+.01, yB=HB+HM+.01;
+      return V(XP+s*(DW-.02),yA+(yB-yA)*u-.72*u*(1-u),z); };
+    const fg=[], pg=[];
+    for(const s of [-1,1]){
+      const pts=[]; for(let i=0;i<=24;i++) pts.push(fune(s,i/24));
+      fg.push(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts),48,.0055,6,false));
+      for(let i=1;i<NA;i+=2){ const u=(ZP0+.03-assi[i][2])/(ZP0+.03-(ZB+.035)), top=fune(s,u);
+        pg.push(cilindroTraGeo(V(top.x,assi[i][3]+.002,assi[i][2]),top,.0022,.0022,5)); }
+    }
+    // le due portanti intrecciate a blocchi di un segmento (36 vertici): nella firma il drawRange le tende insieme
+    const [fa,fb]=fg.map(q=>q.toNonIndexed()), ff=new THREE.BufferGeometry(), nTub=fa.attributes.position.count;
+    for(const [n,s] of [['position',3],['normal',3],['uv',2]]){
+      const A=fa.attributes[n].array, B=fb.attributes[n].array, out=new Float32Array(A.length*2), c=36*s;
+      for(let i=0,o=0;i<A.length;i+=c){ out.set(A.subarray(i,i+c),o); o+=Math.min(c,A.length-i); out.set(B.subarray(i,i+c),o); o+=Math.min(c,B.length-i); }
+      ff.setAttribute(n,new THREE.BufferAttribute(out,s)); }
+    const funi=add(unisci([ff].concat(pg)),mFune,g); funi.castShadow=true; funi.frustumCulled=false;
+    const fPos=funi.geometry.attributes.position, fBase=Float32Array.from(fPos.array), fPeso=new Float32Array(fPos.count);
+    for(let i=0;i<fPos.count;i++){ const z=fBase[i*3+2], y=fBase[i*3+1], u=clamp01((ZP0+.03-z)/(ZP0+.03-(ZB+.035)));
+      const yd=quotaPonte(z), yf=fune(1,u).y; fPeso[i]=Math.sin(PI*u)*clamp01((y-yd)/Math.max(.05,yf-yd)); }
+    const nFuni=2*nTub;                                  // vertici delle due portanti (prima parte della geometria)
+    const ombraP=ombra(g,XP,(ZP0+ZP1)/2,2*DW+.06,LP,.28,true,.0085);
+
+    // ---- sul bancone: sponda stampata davanti (aperta sul ponte), ballatoi lilla con mensole, tappetino ----
+    const bb=[], ba=[];
+    for(const [x0,x1] of [[BAN.x0+.02,XP-CW],[XP+CW,BAN.x1-.02]]) bb.push(pezzo(rbox(x1-x0,HS,SB,rr,2),(x0+x1)/2,HB+HS/2,ZB-SB/2));
+    for(const [x0,x1] of [[BAN.x0+.02,XP-DW],[XP+DW,BAN.x1-.02]]){
+      ba.push(pezzo(rbox(x1-x0,SA,ALA,.006,2),(x0+x1)/2,HB-SA/2,ZB+ALA/2));
+      for(let x=x0+.12;x<x1-.05;x+=.7) ba.push(pezzo(rbox(.018,.075,.11,.006,2),x,HB-SA-.0375,ZB+.055)); }
+    const bordiB=add(uvQuota(unisci(bb)),matRampa,g); bordiB.castShadow=true; bordiB.receiveShadow=true;
+    const ballB=add(uvQuota(unisci(ba)),matBall,g); ballB.castShadow=true; ballB.receiveShadow=true;
+    // tappetino d'erba sul bancone: stesso stencil di matErba (la coppa si vede nel foro)
     const tm=matErba.map.clone(), tb=matErba.bumpMap.clone();
     for(const x of [tm,tb]){ x.repeat.set(MAT.w/2,MAT.d/2); x.needsUpdate=true; }
     const mTap=STD(0xffffff,{map:tm,bumpMap:tb,bumpScale:.0045,roughness:.93,envMapIntensity:.6,
       stencilWrite:true,stencilWriteMask:0,stencilRef:1,stencilFunc:THREE.NotEqualStencilFunc});
-    const tappeto=new THREE.Group(); tappeto.position.set(MAT.x-XT+MAT.w/2,H_TAV,MAT.z-ZT); suTav.add(tappeto);
+    const tappeto=new THREE.Group(); tappeto.position.set(MAT.x+MAT.w/2,HB,MAT.z); g.add(tappeto);
     add(rbox(MAT.w,.003,MAT.d,.0015,2),mTap,tappeto,-MAT.w/2,.0015,0).receiveShadow=true;
-    const rotolo=add(new THREE.CylinderGeometry(1,1,MAT.d,24).rotateX(PI/2),mTap,suTav); rotolo.castShadow=true; rotolo.visible=false;
-    // barattolo di tempera appeso sotto il piano: avvolge la parte della coppa che sporge in galleria
-    const barattolo=new THREE.Group(); barattolo.position.set(BUCA.x-XT,H_TAV-.035,BUCA.z-ZT); suTav.add(barattolo);
-    const pBa=[[.001,-.136],[.05,-.136],[.061,-.133],[.066,-.126],[.066,-.012],[.0625,-.007],[.0625,0]].map(([r,y])=>new THREE.Vector2(r,y));
-    add(new THREE.LatheGeometry(pBa,40),PHY(0xf3f1ea,{roughness:.35,clearcoat:.4,side:THREE.DoubleSide}),barattolo).castShadow=true;
-    const mTinta=PHY(0xffffff,{roughness:.25,clearcoat:.6});
-    add(new THREE.CylinderGeometry(.0668,.0668,.04,40,1,true),mTinta,barattolo,0,-.075,0);
-    add(rbox(.012,.034,.006,.003,2),mTinta,barattolo,.028,-.02,.0615,0,.42,0);
-    add(new THREE.SphereGeometry(.0065,10,8),mTinta,barattolo,.0285,-.037,.0628);
-    linearizza(suTav);
+    const rotolo=add(new THREE.CylinderGeometry(1,1,MAT.d,24).rotateX(PI/2),mTap,g); rotolo.castShadow=true; rotolo.visible=false;
+    // piano e mobile del bancone: copie con il test dello stencil (gli originali sono in aula, materiali condivisi)
+    const BANC={piano:null, mobile:null, copie:[]};
+    for(const o of aula.children){
+      if(!o.isMesh || o.geometry.type!=='BoxGeometry' || Math.abs(o.position.x-(BAN.x0+BAN.x1)/2)>.01) continue;
+      if(o.material===matLegnoChiaro && Math.abs(o.position.y-(HB-.02))<.005) BANC.piano=o;
+      else if(Math.abs(o.position.y-(HB-.04)/2)<.005) BANC.mobile=o;
+    }
+    for(const o of [BANC.piano,BANC.mobile]){ if(!o) continue;
+      const mt=giaLineare(o.material.clone()); Object.assign(mt,{stencilWrite:true,stencilWriteMask:0,stencilRef:1,stencilFunc:THREE.NotEqualStencilFunc});
+      const c=new THREE.Mesh(o.geometry,mt); c.position.copy(o.position); c.rotation.copy(o.rotation); c.scale.copy(o.scale);
+      c.castShadow=o.castShadow; c.receiveShadow=o.receiveShadow; c.visible=false; g.add(c); BANC.copie.push([o,c]); }
+    linearizza(g); linearizza(suTav);                     // (le copie sono gia' registrate: restano com'erano)
     matBallClip.color.copy(matBall.color);                // il gemello col clipping non e' su nessuna mesh: stesso colore lineare
+    // tastiere, mouse e maglie del tavolone est (mesh unite): via durante la buca
+    const TASTIERE=tav.children.filter(o=>o.isMesh && [matTasti,matMouse,matAllumChiaro,matMaglia].includes(o.material));
 
     // ---- firma: bordo caldo dello strato appena deposto ----
     const pianoXZ=new THREE.PlaneGeometry(1,1).rotateX(-PI/2);
@@ -9128,7 +9398,7 @@ BUCHE[5]=(()=>{
         q=1+.18*Math.sin(3*a+.7)+.1*Math.sin(5*a+2.1)+.06*Math.sin(8*a+.3); p.setXY(i,x*q,y*q); } gM.rotateX(-PI/2); }
     const mSchizzo=STD(0xffffff,Object.assign({roughness:.4},decal));
     const SCH=[[.3,.085,.022],[1.25,.11,.014],[2.1,.078,.018],[2.9,.125,.011],[3.6,.09,.02],[4.4,.115,.013],[5.2,.082,.016],[5.9,.135,.009]];
-    const schizzi=SCH.map(([a,r,s])=>{ const m=add(gM,mSchizzo,g,BUCA.x+Math.cos(a)*r,H_TAV+.0055,BUCA.z+Math.sin(a)*r,0,a,0);
+    const schizzi=SCH.map(([a,r,s])=>{ const m=add(gM,mSchizzo,g,BUCA.x+Math.cos(a)*r,HB+.0055,BUCA.z+Math.sin(a)*r,0,a,0);
       m.userData.s=s; m.renderOrder=3; m.visible=false; return m; });
     let tSchizzo=-1;
 
@@ -9139,33 +9409,54 @@ BUCHE[5]=(()=>{
       try{ renderer.compile(scene,camera); }catch(e){}
       scene.remove(g); materialeStampa(false); renderer.localClippingEnabled=prima; vis.forEach(([o,v])=>o.visible=v); }
 
-    // ---- stencil sul piano del tavolo (solo mentre la coppa e' sul tavolo) ----
-    const LACCA0={w:matLacca.stencilWrite, m:matLacca.stencilWriteMask, r:matLacca.stencilRef, f:matLacca.stencilFunc};
-    function stencilPiano(si){
-      if(si){ matLacca.stencilWrite=true; matLacca.stencilWriteMask=0; matLacca.stencilRef=1; matLacca.stencilFunc=THREE.NotEqualStencilFunc; }
-      else { matLacca.stencilWrite=LACCA0.w; matLacca.stencilWriteMask=LACCA0.m; matLacca.stencilRef=LACCA0.r; matLacca.stencilFunc=LACCA0.f; }
+    // ---- foro nel bancone: copie con lo stencil al posto degli originali (solo con la telecamera sopra il piano) ----
+    let foroOn=false;
+    function foroBancone(si){
+      si=!!si && BANC.copie.length===2; if(si===foroOn) return; foroOn=si;
+      for(const [o,c] of BANC.copie){ o.visible=!si; c.visible=si; }
     }
+    function tastiere(vis,giu=0){ for(const o of TASTIERE){ o.visible=vis; o.position.y=vis?-giu:0; } }   // giu: affondano nel piano
     function nascondiStampa(){
       strato.concat(bordo,skirt,[caldoPunta]).forEach(m=>m.visible=false);
       ugello.visible=false; ombraU.visible=false; filo.visible=false; rotolo.visible=false; stampanteViva(false);
     }
     function materialeStampa(clip){ for(const [m,a,b] of stampati){ m.material=clip?b:a; m.castShadow=!clip; } }
+    // ponte: k = frazione deposta (0..1); le assi spuntano con un piccolo rimbalzo, le funi si tendono dietro l'ugello
+    function mostraPonte(kp){
+      for(let i=0;i<NA;i++){ const [a,ms]=assi[i], u=kp*NA-i, e=u<=0?.001:Math.max(.001,elastico(Math.min(1,u/1.6)));
+        a.visible=ms.visible=u>0; a.scale.set(1,1,kp>=1?1:e); ms.scale.set(1,kp>=1?1:e,1); }
+      montanti.visible=kp>0; montantiB.visible=kp>=.92; ombraP.visible=kp>0; funi.visible=kp>0;
+      // funi portanti (prima parte della geometria) che si tendono dietro l'ugello; i pendini con l'ultima asse
+      funi.geometry.setDrawRange(0,kp>=1?Infinity:Math.round(nFuni*clamp01(kp*1.08)/3)*3);
+    }
     // mostra(u): 0 = nascosti, 1 = disposizione finale; in mezzo (buca che si lascia) tutto si abbassa
     function mostra(u){
       nascondiStampa(); materialeStampa(false);
       const kk=Math.max(.001,u);
       rampa.visible=ombraR.visible=u>0; rampa.scale.set(1,kk,1);
-      for(const m of [bordi,ballatoi]){ m.visible=u>.4; m.position.y=-.035*(1-u); }   // all'uscita affondano e spariscono
+      for(const m of [bordi,ballatoi,bordiB,ballB,montanti,montantiB,funi]){ m.visible=u>.4; m.position.y=-.035*(1-u); }   // all'uscita affondano
+      for(const [a,ms] of assi){ a.visible=ms.visible=u>0; a.scale.set(kk,1,1); ms.scale.set(1,kk,1); }
+      ombraP.visible=u>0; funi.geometry.setDrawRange(0,Infinity);
       tappeto.visible=u>0; tappeto.scale.set(kk,1,1);
-      barattolo.visible=u>0; barattolo.scale.setScalar(kk);
       scia.visible=u>0 && SC.n>0; mScia.opacity=Math.min(1,u);
       schizzi.forEach(m=>m.visible=u>0 && tSchizzo>=0); mSchizzo.opacity=Math.min(1,u);
-      stencilPiano(u>=1);
+      if(u<1) foroBancone(false);
+      if(u<=0) tastiere(true);                            // via in gioco (ogniFrame) e nella firma; le rimette esci()
       if(u>=1 && G.casa) coloraCasa();                   // anche dal rotolo d'erba (ingresso dal menu, senza firma)
     }
     function coloraCasa(){                                // colori della Casa (scritti gia' lineari: il gruppo e' gia' linearizzato)
       mFilo.color.set(tintaCasa(.4)).convertSRGBToLinear().multiplyScalar(1.1);
-      mTinta.color.set(tintaCasa(.15)).convertSRGBToLinear();
+      mAsse.color.set(tintaCasa(.18)).convertSRGBToLinear();
+    }
+    // funi che oscillano (solo grafica): ampiezza maggiore con la pallina sul ponte
+    let ampF=0, fasF=0;
+    function oscilla(dt){
+      if(!funi.visible) return;
+      const sul=G.p && G.p.liv===1 && G.p.plat===IDP && !G.p.ferma, v=G.p?Math.hypot(G.p.vx,G.p.vz):0;
+      ampF+=((sul?.006+.01*Math.min(1,v):.0025)-ampF)*Math.min(1,dt*3); fasF+=dt*2*PI*.8;
+      const s=ampF*Math.sin(fasF), a=fPos.array;
+      for(let i=0;i<fPos.count;i++) a[i*3]=fBase[i*3]+s*fPeso[i];
+      fPos.needsUpdate=true;
     }
 
     // ---- scia ----
@@ -9173,7 +9464,7 @@ BUCHE[5]=(()=>{
     // quota della pennellata: la stessa FISICA.terreno della pallina + la superficie che si vede + 2 mm
     function quota(x,z,liv,plat){
       const h=FISICA.terreno(G.mondo,x,z,liv,plat).h;
-      if(liv===1) return h+(dentroTappeto(x,z)?.003:0)+.002;                      // piano (o tappetino)
+      if(liv===1) return h+(plat===IDB && dentroTappeto(x,z)?.003:0)+.002;        // piano, ponte, bancone (o tappetino)
       if(Math.abs(x-gTee.position.x)<.18 && Math.abs(z-gTee.position.z)<.18) return .014+.002;   // tappetino del tee
       return Math.max(h,.004)+.002;                                                // erba (4 mm) o rampa
     }
@@ -9271,13 +9562,16 @@ BUCHE[5]=(()=>{
     // ---- la firma: tutto in funzione di t ----
     const _p=V(0,0,0), _q=V(0,0,0);
     const quotaR=x=>Math.max(0,Math.min(H_TAV,PEND*(X_BASE-x)));
-    const PER=[[ATTESA.x,ATTESA.z],[X_BASE+.12,RZ],[X_TOP-.06,RZ],[BUCA.x,BUCA.z]];
+    // percorso della bandierina: ai piedi della rampa, su per la rampa, sul piano fino all'asse del ponte, giu' per il
+    // ponte, sul bancone fino alla buca
+    const PER=[[ATTESA.x,ATTESA.z],[X_BASE+.12,RZ],[X_TOP-.06,RZ],[XP+.05,RZ-.1],[XP,ZT-.45],[XP,ZB-.06],[BUCA.x,BUCA.z]];
     const LPER=[0]; for(let i=1;i<PER.length;i++) LPER.push(LPER[i-1]+Math.hypot(PER[i][0]-PER[i-1][0],PER[i][1]-PER[i-1][1]));
-    function percorsoFlag(u,out){                         // u 0..1 lungo il percorso, con 5 saltelli
+    const quotaPer=(x,z)=>z<ZB?HB:z<ZP0?quotaPonte(z):x<=X_TOP?H_TAV:quotaR(x);
+    function percorsoFlag(u,out){                         // u 0..1 lungo il percorso, con 9 saltelli
       const l=u*LPER[LPER.length-1]; let i=1; while(i<LPER.length-1 && l>LPER[i]) i++;
       const f=clamp01((l-LPER[i-1])/(LPER[i]-LPER[i-1])), x=PER[i-1][0]+(PER[i][0]-PER[i-1][0])*f, z=PER[i-1][1]+(PER[i][1]-PER[i-1][1])*f;
-      const y=x<=X_TOP?H_TAV:quotaR(x), salto=Math.sin(PI*((u*5)%1))*.17*(u<1?1:0);
-      return out.set(x,y+salto,z);
+      const salto=Math.sin(PI*((u*9)%1))*.15*(u<1?1:0);
+      return out.set(x,quotaPer(x,z)+salto,z);
     }
     const coloreStrato=h=>_c.set(COLORI_RAMPA[Math.max(0,Math.min(4,Math.floor(h/H_TAV*5)))]).convertSRGBToLinear();
     function striscia(m,x0,x1,z0,z1,y){ m.position.set((x0+x1)/2,y,(z0+z1)/2); m.scale.set(Math.max(.001,Math.abs(x1-x0)),1,Math.max(.001,Math.abs(z1-z0))); }
@@ -9288,16 +9582,17 @@ BUCHE[5]=(()=>{
       // 1. stampante del bancone: carrello che sfreccia, bobina che gira, bip
       stampanteViva(t<TL.ritira1);
       const sv=t-TL.sveglia;
-      carrello.position.x=XS+.05+(sv>0&&sv<.7?.12*Math.sin(2*PI*5*sv)*Math.sin(PI*sv/.7):t>TL.strati0&&t<TL.strati1?.09*Math.sin(2*PI*1.6*(t-TL.strati0)):0);
+      carrello.position.x=XS+.05+(sv>0&&sv<.7?.12*Math.sin(2*PI*5*sv)*Math.sin(PI*sv/.7):t>TL.strati0&&t<TL.ponte1?.09*Math.sin(2*PI*1.6*(t-TL.strati0)):0);
       bobina.rotation.z=-5*(Math.min(Math.max(t,TL.sveglia),TL.ritira1)-TL.sveglia);
       led.visible=t>TL.sveglia && t<TL.ritira1 && (t*6%1)<.6;
       suona('bip',TL.sveglia,()=>{ for(let i=0;i<3;i++) tono(1900,.06,'sine',.07,i*.14); });
-      // 2. quota stampata: gradini di 2 cm fino alla cima delle sponde
+      // 2. quota stampata della rampa: gradini di 2 cm fino alla cima delle sponde
       const h=t<TL.strati0?0:Math.min(HMAX,Math.floor((t-TL.strati0)/(TL.strati1-TL.strati0)*HMAX/.02+1)*.02);
       const vivo=h>0 && h<HMAX;
+      const kp=clamp01((t-TL.ponte0-.12)/(TL.ponte1-TL.ponte0-.22));   // ponte: frazione deposta
       // 3. ugello gigante: compare con un rimbalzo ALTO sopra la rampa che verra' (sotto scivola ancora il tavolone
-      //    est, schermi compresi), scende all'inizio dello skirt, lo traccia, stampa a zig-zag, si alza.
-      //    La punta resta sempre ad almeno 10 cm dalla testata del tavolo: il corpo dell'ugello non entra nel piano.
+      //    est, schermi compresi), scende all'inizio dello skirt, lo traccia, stampa a zig-zag, corre lungo il ponte
+      //    deponendo le assi, si alza. Sulla rampa la punta resta ad almeno 10 cm dalla testata del tavolo.
       const P0=_q.set(X_TOP+RL*.55,1.35,RZ);
       let sc=0;
       if(t>=TL.filo0 && t<TL.ritira1){
@@ -9305,21 +9600,28 @@ BUCHE[5]=(()=>{
         if(t<TL.skirt0){ _p.copy(P0).y+=.03*Math.sin(t*9);
           if(t>TL.scende0) _p.lerp(_a.set(SK[0][0],.006,SK[0][1]),ease((t-TL.scende0)/(TL.skirt0-TL.scende0))); }
         else if(t<TL.strati0){ _p.set(SK[0][0],.006,SK[0][1]); puntoSkirt((t-TL.skirt0)/(TL.skirt1-TL.skirt0),_p); }
-        else {
+        else if(t<TL.ponte0){
           const hh=Math.min(h,H_TAV), xf=X_BASE-hh/PEND, ts=t-TL.strati0, tri=Math.abs(((ts*5.5)%2)-1);
           if(h<=H_TAV) _p.set(XU+Math.max(0,xf-XU)*(.5-.5*Math.cos(ts*4.1)),h+.004,RZ+(RW/2-.03)*(2*tri-1));
           else _p.set(XU+.3*(.5-.5*Math.cos(ts*6)),h+.004,ZT+(tri<.5?RW0+SP/2:RW1-SP/2));   // ultimi strati: le sponde
-          if(t>=TL.ritira0){ const r=ease(Math.min(1,(t-TL.ritira0)/(TL.ritira1-TL.ritira0))); _p.y+=r*.55; sc*=1-r; }
+        } else {
+          // dalla cima della rampa all'imbocco del ponte (alto, sopra le sponde), poi lungo il ponte a zig-zag
+          const tp=t-TL.ponte0, zz=ZP0-LP*kp, zig=Math.sin(tp*26)*(DW-.04);
+          _b.set(XP+zig,quotaPonte(zz)+.006,zz);
+          if(tp<.12){ _a.set(XU+.15,HMAX+.004,ZT+RW1-SP/2); _p.copy(_a).lerp(_b,ease(tp/.12)); _p.y+=.12*Math.sin(PI*tp/.12); }
+          else _p.copy(_b);
+          if(t>=TL.ritira0-.06 || kp>=1){ _p.set(XP,HB+.01,ZB+.03); }
         }
+        if(t>=TL.ritira0){ const r=ease(Math.min(1,(t-TL.ritira0)/(TL.ritira1-TL.ritira0))); _p.set(XP,HB+.01+r*.55,ZB+.03); sc*=1-r; }
       }
       ugello.visible=sc>.01; ugello.position.copy(_p); ugello.scale.setScalar(Math.max(.001,sc));
       // ombra di contatto sotto la punta: sparisce quando l'ugello e' alto (materiale condiviso: si scala, non si tocca l'opacita')
-      const yApp=t>=TL.strati0?Math.min(h,quotaR(_p.x)):0, kO=Math.min(1,sc)*clamp01(1-(_p.y-yApp)/.45);
+      const yApp=t>=TL.ponte0?quotaPer(_p.x,_p.z):t>=TL.strati0?Math.min(h,quotaR(_p.x)):0, kO=Math.min(1,sc)*clamp01(1-(_p.y-yApp)/.45);
       ombraU.visible=ugello.visible && kO>.01; ombraU.position.set(_p.x,yApp+.009,_p.z); ombraU.scale.set(.22*kO,1,.22*kO);
-      caldoPunta.visible=vivo && sc>.5; caldoPunta.position.set(_p.x,h+.003,_p.z);
+      caldoPunta.visible=(vivo || (kp>0 && kp<1)) && sc>.5; caldoPunta.position.set(_p.x,(kp>0&&kp<1?quotaPonte(_p.z):h)+.003,_p.z);
       suona('pop',TL.filo0+.15,()=>tono(330,.08,'triangle',.08,0,520));
       if(t<TL.skirt0) skirt.forEach(m=>m.visible=false); else if(t<TL.strati0) puntoSkirt((t-TL.skirt0)/(TL.skirt1-TL.skirt0),_a);
-      else if(t<TL.ritira1) puntoSkirt(1,_a); else skirt.forEach(m=>m.visible=false);
+      else if(t<TL.ponte0) puntoSkirt(1,_a); else skirt.forEach(m=>m.visible=false);
       [1.15,1.25,1.35].forEach((q,i)=>suona('sk'+i,q,()=>tono([440,554,659][i],.06,'triangle',.05)));
       // 4. filo: dall'ugello del carrello all'ingresso dell'ugello gigante
       if(t>=TL.filo0 && t<TL.ritira1 && sc>.01){
@@ -9328,7 +9630,7 @@ BUCHE[5]=(()=>{
         tendi(_a,_b.lerp(_a,1-u),.0035); filo.visible=u>.01;
       } else filo.visible=false;
       suona('filo',TL.filo0,()=>{ rumore(.18,.05,2600); tono(700,.16,'sine',.05,0,1500); });
-      // 5. rampa, sponde e ballatoi: clipping a gradini (SOLO in stampa), poi il materiale senza clipping
+      // 5. rampa, sponde, fermapalla e ballatoi: clipping a gradini (SOLO in stampa), poi il materiale senza clipping
       rampa.visible=ombraR.visible=h>0; rampa.scale.set(1,1,1);
       bordi.visible=h>H_TAV; ballatoi.visible=h>H_TAV-SA-.08; bordi.position.y=ballatoi.position.y=0;
       materialeStampa(vivo); if(vivo) PIANO.constant=h;
@@ -9344,9 +9646,16 @@ BUCHE[5]=(()=>{
           striscia(bordo[0],X_TOP,X_TOP+e,ZT+RW0,ZT+RW1,y+.0004); striscia(bordo[1],xf-e,xf,ZT+RW0,ZT+RW1,y+.0004);
           striscia(bordo[2],X_TOP,xf,ZT+RW0,ZT+RW0+e,y+.0004); striscia(bordo[3],X_TOP,xf,ZT+RW1-e,ZT+RW1,y+.0004); }
       }
-      for(let i=0;i<5;i++) suona('ch'+i,TL.strati0+.3+i*.5,()=>tono([440,554,659][i%3],.05,'triangle',.04));
+      for(let i=0;i<4;i++) suona('ch'+i,TL.strati0+.3+i*.4,()=>tono([440,554,659][i%3],.05,'triangle',.04));
+      // 6. ponte: le assi spuntano dietro l'ugello; alla fine sponda e ballatoi del bancone
+      mostraPonte(kp); montanti.position.y=funi.position.y=0;
+      // sponda e ballatoi del bancone: escono dal piano con un rimbalzo quando l'ugello arriva in fondo al ponte
+      const tB0=TL.ponte0+.12+.92*(TL.ponte1-TL.ponte0-.22), eb=elastico(clamp01((t-tB0)/.35));
+      bordiB.visible=ballB.visible=montantiB.visible=t>=tB0; bordiB.position.y=ballB.position.y=montantiB.position.y=-.04*(1-eb);
+      for(let i=0;i<NA;i+=3) suona('asse'+i,TL.ponte0+.12+(i+.5)/NA*(TL.ponte1-TL.ponte0-.22),()=>tono(520+i*28,.05,'triangle',.045,0,700+i*28));
       suona('fine',TL.ritira0,()=>{ for(let i=0;i<3;i++) tono(1900,.06,'sine',.07,i*.14); });
-      // 6. bandierina: aspetta ai piedi della rampa, poi risale a saltelli; il buco si chiude nel prato e si riapre nel tappetino
+      // 7. bandierina: aspetta ai piedi della rampa, poi risale e attraversa il ponte a saltelli; il buco si chiude nel
+      //    prato e si riapre nel tappetino del bancone
       const fu=(t-TL.salita0)/(TL.salita1-TL.salita0);
       if(fu<=0) T.flagA.set(ATTESA.x,0,ATTESA.z);
       else if(fu<1) percorsoFlag(fu,T.flagA);
@@ -9354,39 +9663,40 @@ BUCHE[5]=(()=>{
       const kc=t<TL.chiude?1:t<TL.apre?Math.max(.001,1-ease(Math.min(1,(t-TL.chiude)/.15))):Math.max(.001,elastico((t-TL.apre)/.35));
       gBuca.scale.set(kc,1,kc);
       suona('plop',TL.chiude,()=>tono(640,.07,'sine',.09,0,320));
-      for(let i=0;i<5;i++) suona('hop'+i,TL.salita0+(i+1)/5*(TL.salita1-TL.salita0)-.01,()=>tono(620+i*45,.05,'sine',.05,0,820+i*45));
+      for(let i=0;i<9;i++) suona('hop'+i,TL.salita0+(i+1)/9*(TL.salita1-TL.salita0)-.01,()=>tono(600+i*30,.05,'sine',.05,0,800+i*30));
       const tw=t-TL.apre; gFlag.rotation.set(0,0,tw>=0?.28*Math.sin(31*tw)*Math.exp(-6.5*tw):0);
       suona('twang',TL.apre,()=>{ tono(196,.3,'triangle',.09,0,180); tono(523,.06,'sine',.07); });
-      // 7. tappetino: si srotola sul piano (il rotolo dell'inizio, in piccolo)
+      // 8. tappetino: si srotola sul bancone (il rotolo dell'inizio, in piccolo)
       const um=ease(clamp01((t-TL.tappeto0)/(TL.tappeto1-TL.tappeto0)));
       tappeto.visible=um>0; tappeto.scale.set(Math.max(.001,um),1,1);
       rotolo.visible=um>0 && um<1;
       if(rotolo.visible){ const r=.004+.016*Math.sqrt(1-um); rotolo.scale.set(r,r,1);
-        rotolo.position.set(MAT.x-XT+MAT.w/2-MAT.w*um,H_TAV+r,MAT.z-ZT); rotolo.rotation.set(0,0,MAT.w*um/r); }
+        rotolo.position.set(MAT.x+MAT.w/2-MAT.w*um,HB+r,MAT.z); rotolo.rotation.set(0,0,MAT.w*um/r); }
       suona('tap',TL.tappeto0,()=>rumore(.3,.05,900));
-      // 8. barattolo sotto il piano e foro nel piano (stencil) quando arriva la coppa
-      barattolo.visible=t>=TL.apre; barattolo.scale.setScalar(1);
-      stencilPiano(t>=TL.apre);
+      // 9. foro nel bancone (stencil) quando arriva la coppa; tastiere, mouse e maglie affondano nel piano (3,5 cm)
+      foroBancone(t>=TL.apre && camera.position.y>HB+.012);
+      const kt=clamp01((t-.15)/.4); tastiere(kt<1,.016*ease(kt));
     }
     function finale(T){
-      mostra(1);
+      mostra(1); tastiere(false);
       if(T && S.flagFin) T.flagA.copy(S.flagFin);
       gBuca.scale.set(1,1,1); gFlag.rotation.set(0,0,0);
       if(S.clipPrima!==null){ renderer.localClippingEnabled=S.clipPrima; S.clipPrima=null; }
     }
     function inizio(T){
-      coloraCasa(); mostra(0); stencilPiano(false);
+      coloraCasa(); mostra(0); foroBancone(false); tastiere(true);
       if(S.clipPrima===null) S.clipPrima=renderer.localClippingEnabled;
       renderer.localClippingEnabled=true;
       T._tp=undefined; T._s={};
     }
     function ripristina(){                                // esci(): rimette a posto cio' che la buca ha cambiato
-      svuotaScia(); stencilPiano(false); stampanteViva(false); nascondiStampa(); materialeStampa(false);
+      svuotaScia(); foroBancone(false); tastiere(true); stampanteViva(false); nascondiStampa(); materialeStampa(false);
       gBuca.scale.set(1,1,1); gFlag.rotation.set(0,0,0); gFlag.scale.set(1,1,1); S.fs=1;
       if(S.clipPrima!==null){ renderer.localClippingEnabled=S.clipPrima; S.clipPrima=null; }
     }
     PR={gruppo:g, mostra, stampa, inizio, finale, ripristina, aggiornaScia, aggiornaSchizzo, svuotaScia, quadro, schizza, coloraCasa,
-        diag:()=>({stampante:!!(ORIG.telaio&&ORIG.bobina), tratti:SC.n, colpi:SC.colpi})};
+        oscilla, foroBancone, tastiere, giocabile:()=>rampa.visible && rampa.scale.y>=1 && !ugello.visible,
+        diag:()=>({stampante:!!(ORIG.telaio&&ORIG.bobina), bancone:BANC.copie.length, tastiere:TASTIERE.length, foro:foroOn, tratti:SC.n, colpi:SC.colpi})};
     return PR;
   }
 
@@ -9527,10 +9837,12 @@ BUCHE[5]=(()=>{
         o.position.set(q.B.x,0,q.B.z); o.rotation.set(0,q.B.ry,0); o.scale.set(1,e,1); } }
   }
   // Telecamera della buca, in quattro casi (negli altri decide il motore e riprende da dove e' rimasta):
-  // 1. pallina sul piano. posaCameraGioco accorcia e alza il braccio quando tra pallina e camera c'e' un
-  //    segmento del livello della pallina (vistaBloccata li tratta tutti come muri): sul piano lo sono anche
-  //    tastiere, piedi degli iMac e sponde, alti 1-3 cm, e la pallina usciva dall'inquadratura in basso.
-  //    Qui la camera sta dietro la pallina, sopra gli schermi degli iMac (alti 45 cm).
+  // 1. pallina in alto (piano, ponte, bancone). posaCameraGioco accorcia e alza il braccio quando tra pallina e
+  //    camera c'e' un segmento del livello della pallina (vistaBloccata li tratta tutti come muri): in alto lo sono
+  //    anche piedi degli iMac e sponde, alti 1-3 cm, e la pallina usciva dall'inquadratura in basso.
+  //    Qui la camera sta dietro la pallina, sopra gli schermi degli iMac (alti 45 cm). Sul bancone dietro la
+  //    pallina possono esserci la parete delle porte o una bussola: il braccio si accorcia (fino a zero, camera
+  //    sopra la pallina) e sale, cosi' la camera non entra mai nel muro, nella bussola o nel bancone.
   // 2. pallina contro una parete con la mira verso l'aula: i tiri che non salgono tornano giu' dalla rampa e
   //    si fermano spesso contro la vetrata, a 1,3 m dal tee; il braccio del motore (minimo 30 cm) finiva fuori
   //    dall'aula, dietro la parete. Qui il braccio si accorcia fino a zero e la camera sale sopra la pallina.
@@ -9556,7 +9868,9 @@ BUCHE[5]=(()=>{
     const a=G.camAng, dx=Math.cos(a), dz=Math.sin(a), px=G.p.x, pz=G.p.z, y=G.p.h;
     if(G.p.liv===1){
       modo='piano';
-      _cp.set(px-dx*1.0-dz*.18, y+.95, pz-dz*1.0+dx*.18);
+      const libera=(x,z)=>dentroAula(x,z,.15) && !AULA.bussole.some(b=>x>b.x0-.15 && x<b.x1+.15 && z<b.z+.15);
+      let d=1.0; while(d>0 && !libera(px-(dx+dz*.18)*d,pz-(dz-dx*.18)*d)) d-=.05; d=Math.max(0,d);
+      _cp.set(px-(dx+dz*.18)*d, y+.95+(1-d)*.6, pz-(dz-dx*.18)*d);
       _cl.set(px+dx*1.5-dz*.08, y+.04, pz+dz*1.5+dx*.08);
     } else {
       const q=posaCameraGioco();
@@ -9588,7 +9902,7 @@ BUCHE[5]=(()=>{
     camera.position.copy(S.cam.pos); lookCorrente.copy(S.cam.look); camera.lookAt(lookCorrente);
   }
   return {
-    n:6, skill:5, par:3,
+    n:6, skill:5, par:4,
     tee:TEE, buca:BUCA, emblema:EMB,
     disponi, mondo,
     props:{crea},
@@ -9608,17 +9922,23 @@ BUCHE[5]=(()=>{
       const P=PR; if(!P) return;
       camPiano(dt);
       if(S.pRif!==G.p){ S.pRif=G.p; P.svuotaScia();      // pallina nuova (preparaBuca): la scia si azzera
-        // dal tee la buca non si vede e la sua direzione (-174 gradi) sta sul bordo sinistro della finestra della
-        // rampa (-175..-160): la mira iniziale va nel mezzo della rampa. Solo la direzione: la fisica non cambia.
+        // dal tee la direzione della buca non passa dalla rampa (-175..-160 gradi): la mira iniziale va nel mezzo
+        // della rampa. Solo la direzione: la fisica non cambia.
         if(G.p.x===TEE.x && G.p.z===TEE.z){ G.mira=MIRA0; G.camAng=MIRA0; } }
-      P.aggiornaScia(); P.aggiornaSchizzo(t);
+      P.aggiornaScia(); P.aggiornaSchizzo(t); P.oscilla(dt);
+      if(G.fase!=='transizione') P.tastiere(false);      // anche entrando dal menu (rotolo): mostra(1) non le tocca,
+                                                          // perche' a fine percorso il riavvolgimento chiama mostra(1->0)
+      // il gettone sta sul ponte: moneta, piedistallo e ombra seguono la pendenza (esci() lo raddrizza)
+      gEmblema.rotation.x=Math.atan(PP); S.emb=true;
+      // foro nel bancone: copie con lo stencil solo con la telecamera sopra il piano (dopo la firma)
+      if(G.fase!=='transizione') P.foroBancone(P.giocabile() && camera.position.y>HB+.012);
       // bandierina un po' piu' alta: dal tee il drappo deve spuntare sopra gli schermi degli iMac
       if(G.fase==='transizione') S.fs=1;
       else { S.fs+=(1.4-S.fs)*Math.min(1,dt*5); gFlag.scale.setScalar(S.fs); }
       if(G.fase==='fine' && !S.quadro){ S.quadro=true; P.quadro(); }   // chiudiBuca ha gia' scritto il maxischermo
     },
     evento(e){ if(e.tipo==='buca' && PR) PR.schizza(tGlob); },
-    esci(){ if(PR) PR.ripristina(); }
+    esci(){ if(S.emb){ gEmblema.rotation.x=0; S.emb=false; } if(PR) PR.ripristina(); }
   };
 })();
 
@@ -9631,9 +9951,12 @@ BUCHE[5]=(()=>{
    restano ai tavoloni. In prima fila siedono le mascotte delle altre tre Case
    (create al caricamento, senza mazza e senza la luce della candela: il numero
    di luci della scena non cambia mai).
-   Emblema: dietro la quinta ovest, sotto il mini canestro, chiuso verso la
-   platea da un baule di scena. Dal tee si prende con una sponda sul bordo della
-   parete ovest (tiro lungo, quasi a piena potenza).
+   Emblema: all'ingresso del corridoio della platea, 80 cm davanti al tee, sotto
+   il cordone di velluto teso tra due colonnine d'ottone (solo grafica: la
+   pallina passa sotto il cordone, la fisica non cambia). Sta sul percorso ovvio:
+   la mira iniziale punta già lungo il corridoio, sulla bandierina, e anche chi
+   gira attorno all'asta a est o a ovest ci passa sopra. Quando lo prendi il
+   cordone ondeggia e il pubblico fa festa. Il baule resta come arredo del palco.
    Firma "Tende giù, luci in sala, occhio di bue" (5,4 s, funzione del tempo):
    cambio scena con le botole del palco (la vecchia disposizione sprofonda nel
    prato, la nuova risale: nessun arredo ne attraversa un altro, da qualunque
@@ -9654,10 +9977,11 @@ BUCHE[5]=(()=>{
    (nessuna buca in uno sulla griglia 1 grado x 0,025 di potenza), si gioca in
    due colpi girandole attorno (par 3).
    Disposizione verificata con il solutore: risolvi(6) chiude in 2 colpi;
-   risolviEmblema(6) prende l'emblema al primo colpo (sponda sulla parete ovest,
-   20 combinazioni della griglia, tutte a 0,85-1 di potenza); la pallina resta
-   nella tasca tra muro, quinta e baule e da lì servono 2 colpi: l'emblema
-   costa circa un colpo.
+   risolviEmblema(6) prende l'emblema al primo colpo, tirando lungo il corridoio:
+   preso il gettone si chiude comunque in 2-3 colpi (par 3). Modello "ragazzo"
+   (mira sulla bandierina, poi in buca; rumore +-4 gradi e +-8% di potenza,
+   200 partite): gettone preso nel 100% delle partite senza colpi in più
+   (girando attorno all'asta a est o a ovest: circa l'80%).
    ===================================================================== */
 BUCHE[6]=(()=>{
   // ---------------- disposizione: le stesse misure per fisica e grafica ----------------
@@ -9666,10 +9990,11 @@ BUCHE[6]=(()=>{
     A1O:[20,40], A1E:[20,40], A2O:[26,38,50], A2E:[26,38],      // angoli (gradi) delle sedie, lato ovest / est:
                                                         // a est resta libero il passaggio dalla porta della bussola
     VIP:[[-1,20],[1,20],[1,40]], PA:{x:-3.6,z:-.2},    // le tre sedie del pubblico: a fine firma si girano verso il corridoio (PA)
-    tee:{x:-3.6,z:1.6}, buca:{x:-3.6,z:-2.5}, emb:{x:-5.17,z:-2.64},
+    tee:{x:-3.6,z:1.6}, buca:{x:-3.6,z:-2.5}, emb:{x:-3.6,z:.8},     // emblema: sotto il cordone, sul corridoio
     mic:{x:-3.6,z:-2.0,r:.11},                          // asta del microfono: la base tonda è l'ostacolo
     quinte:[-4.76,-2.44], qz:-2.3, qs:.08, HQ:2.64,     // quinte: x, punta verso la platea, spessore, altezza
     baule:{x:-5.17,z:-2.14,w:.68,d:.38,h:.42},
+    cordone:{x:-3.6,z:.8,w:.84,hp:.84,yMin:.5},         // colonnine (solo grafica) e cordone di velluto sopra l'emblema
     faro:{x:-3.6,z:-1.05}                               // occhio di bue appeso al soffitto
   };
   const d2r=Math.PI/180, Y1=new THREE.Vector3(0,1,0);
@@ -9824,6 +10149,24 @@ BUCHE[6]=(()=>{
       add(new THREE.SphereGeometry(.024,24,16),STD(0xffffff,{map:tg,bumpMap:tg,bumpScale:.0006,metalness:.9,roughness:.32}),testa,0,0,.125).castShadow=true;
       add(new THREE.TorusGeometry(.0205,.0028,8,24),mCromo,testa,0,0,.11);
       ombre.push({o:ombra(gruppo,K.mic.x,K.mic.z,.3,.3,.85),k:'m'}); }
+    // --- cordone di velluto all'ingresso del corridoio: l'emblema sta proprio sotto. Solo grafica, nessun ostacolo
+    // fisico: le colonnine sono a 42 cm dall'asse del corridoio, fuori dalle linee di tiro verso il palco ---
+    const cordone=new THREE.Group(); cordone.position.set(K.cordone.x,0,K.cordone.z); gruppo.add(cordone);
+    const corda=new THREE.Group();                       // il cordone ruota attorno alla linea dei ganci (ondeggia)
+    { const C=K.cordone, hw=C.w/2, mOtt=STD(0xd8b048,{metalness:.9,roughness:.28});
+      const prof=[[0,.0005],[.11,.0005],[.115,.006],[.11,.013],[.065,.02],[.028,.03],[.02,.05],[0,.05]].map(([r,y])=>new THREE.Vector2(r,y));
+      for(const sx of [-1,1]){
+        add(new THREE.LatheGeometry(prof,32),mOtt,cordone,sx*hw,0,0).castShadow=true;                       // base
+        add(new THREE.CylinderGeometry(.016,.02,C.hp-.05,16),mOtt,cordone,sx*hw,.05+(C.hp-.05)/2,0).castShadow=true;   // fusto
+        add(new THREE.SphereGeometry(.032,20,14),mOtt,cordone,sx*hw,C.hp+.02,0).castShadow=true;           // pomolo
+        add(new THREE.TorusGeometry(.022,.006,8,16),mOtt,cordone,sx*(hw-.024),C.hp-.03,0,0,Math.PI/2,0);   // anello
+        ombre.push({o:ombra(gruppo,C.x+sx*hw,C.z,.3,.3,.7),k:'m'}); }
+      corda.position.y=C.hp-.03; cordone.add(corda);
+      const pts=[]; for(let i=0;i<=20;i++){ const u=i/20; pts.push(V(-hw+.045+(C.w-.09)*u,-(C.hp-.03-C.yMin)*4*u*(1-u),0)); }
+      const mCorda=PHY(0x1b3e8e,{roughness:.86,sheen:new THREE.Color(0x7d9be0),envMapIntensity:.5});
+      add(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts),40,.017,10,false),mCorda,corda).castShadow=true;
+      for(const sx of [-1,1]) add(new THREE.CylinderGeometry(.021,.018,.05,14),mOtt,corda,sx*(hw-.05),-.012,0,0,0,sx*.9);   // puntali d'ottone
+    }
     // --- occhio di bue appeso al soffitto, orientato sulla buca ---
     const faro=new THREE.Group(); faro.position.set(K.faro.x,AULA.h,K.faro.z); gruppo.add(faro);
     const corpo=new THREE.Group(); corpo.position.y=-.3; faro.add(corpo);
@@ -9888,7 +10231,7 @@ BUCHE[6]=(()=>{
       }
       tende.matTela=mTela;
     }
-    PR={gruppo,palco,quinte,mant,baule,mic,faro,corpo,fascio,matFascio,pozza,matPozza,pulv,matPulv,aggiornaPulviscolo,lente,matLente,tende,ombre,
+    PR={gruppo,palco,quinte,mant,baule,mic,cordone,corda,faro,corpo,fascio,matFascio,pozza,matPozza,pulv,matPulv,aggiornaPulviscolo,lente,matLente,tende,ombre,
         luce:{pos:V(K.buca.x,2.2,K.buca.z+.4)}};
     return {gruppo,mostra};
   }
@@ -9900,6 +10243,7 @@ BUCHE[6]=(()=>{
     PR.mant.visible=uq>.002; PR.mant.scale.set(1,Math.max(.001,Math.min(1,uq*1.6)),1);
     PR.baule.visible=ub>.002; PR.baule.scale.setScalar(Math.max(.001,ub));
     PR.mic.visible=um>.002; PR.mic.scale.setScalar(Math.max(.001,um));
+    PR.cordone.visible=um>.002; PR.cordone.scale.setScalar(Math.max(.001,um));   // il cordone spunta con l'asta
     PR.faro.visible=uf>.002; PR.faro.position.y=AULA.h+.45*(1-Math.min(1,uf));
     PR.tende.forEach(t=>{ t.cass.visible=ut>.002; t.cass.scale.x=Math.max(.001,ut); });   // i cassonetti si allungano di lato
     for(const e of PR.ombre){ const k=e.k==='b'?ub:e.k==='m'?um:uq; e.o.visible=k>.3; }
@@ -10021,7 +10365,7 @@ BUCHE[6]=(()=>{
     if(u<1){ const e=ease(u); return {vis:true,modo:'salta',x:a.x+(b.x-a.x)*e,z:a.z+(b.z-a.z)*e,y:(Y_SEDUTA+b.y)*e+.2*Math.sin(Math.PI*u),yaw:yawA+angDiff(yawA,b.ry)*e,u,vel:0}; }
     return {vis:true,modo:'seduto',x:b.x,z:b.z,y:Y_SEDUTA+b.y,yaw:b.ry,u:u,vel:0};
   }
-  const R={risata:-1, rit:.4, paura:0, ultColpo:-2, minD:9, ooh:false};
+  const R={risata:-1, rit:.4, paura:0, ultColpo:-2, minD:9, ooh:false, corda:-1};
   // posa "mi copro gli occhi": braccia alzate (perno), testa china verso le mani, busto in avanti
   const PAURA={braccia:-2.3, testa:.42, busto:.16};
   function aggiornaPubblico(dt,ts){
@@ -10209,6 +10553,8 @@ BUCHE[6]=(()=>{
     inquadra(dt);
     occlusori(dt);
     veli(dt);
+    // preso l'emblema il cordone ondeggia (la pallina gli è passata sotto) e si calma
+    if(R.corda>=0){ R.corda+=dt; PR.corda.rotation.x=.38*Math.sin(R.corda*7.2)*Math.exp(-R.corda*1.5); if(R.corda>4){ R.corda=-1; PR.corda.rotation.x=0; } }
     // reazioni: risata al colpo (lo Sgonfione si sgonfia), "ooh" se la pallina sfiora la buca
     if(G.tColpo>=0 && G.tColpo!==R.ultColpo){ R.ultColpo=G.tColpo; R.risata=0; R.rit=.36+.35*(G.potColpo||.5); R.minD=9; R.ooh=false; risatina(R.rit); }
     if(G.fase==='rotola' && G.p && !G.p.inBuca){
@@ -10217,7 +10563,7 @@ BUCHE[6]=(()=>{
     }
   }
   // le tele delle quinte si fanno trasparenti quando stanno tra la telecamera e la pallina (pallina nella tasca
-  // dell'emblema), e nella vista dall'alto con la mantovana (in prospettiva coprirebbero la tasca e il palco)
+  // dietro le quinte), e nella vista dall'alto con la mantovana (in prospettiva coprirebbero la tasca e il palco)
   function velo(m,ob,dt){ m.opacity+=(ob-m.opacity)*Math.min(1,dt*10); if(Math.abs(m.opacity-ob)<.004) m.opacity=ob; m.depthWrite=m.opacity>.98; }
   function veli(dt){
     const gioco=G.fase!=='transizione' && G.p, cx=camera.position.x, cz=camera.position.z, z0=AULA.zP+.07, z1=K.qz+.04;
@@ -10227,7 +10573,7 @@ BUCHE[6]=(()=>{
     velo(PR.mant.userData.mat,gioco&&G.vistaAlto?.2:1,dt);
   }
   // inquadratura di gioco (solo la vista: mira e fisica non cambiano). La buca è a 50 cm dalla parete della lavagna e
-  // la tasca dell'emblema è stretta tra muro, baule e quinta: con la pallina lì e la mira verso l'aula il braccio della
+  // la tasca dietro la quinta ovest è stretta tra muro, baule e quinta: con la pallina lì e la mira verso l'aula il braccio della
   // telecamera (posaCameraGioco) non trova spazio, finisce oltre il muro (schermo nero) o si alza tanto che la pallina
   // esce dal fondo del quadro. Dopo aggiornaCamera la camera rientra nell'aula scorrendo verso la pallina e lo sguardo
   // si abbassa quanto basta a tenerla nel quadro. Dove il braccio è libero (quasi tutta la buca) non cambia nulla.
@@ -10258,6 +10604,7 @@ BUCHE[6]=(()=>{
   const OCC=new Map(), _oa=new THREE.Vector3(), _ob=new THREE.Vector3();
   const BOX_SEDIA=[[-.235,.235,0,.5,-.265,.25],[-.215,.215,.45,.81,-.235,-.105]];      // seduta con le gambe, schienale
   const BOX_SEDUTO=[[-.17,.17,-.03,.46,-.16,.21]], BOX_ASTA=[[-.05,.05,.03,.66,-.06,.19]], BOX_BAULE=[[-.35,.35,0,.44,-.2,.2]];
+  const BOX_CORDONE=[[-.54,.54,0,.9,-.13,.13]];          // colonnine e cordone all'ingresso del corridoio
   const BOX_LEGO=[[-.32,.32,0,1.66,-.2,.2]];             // l'omino LEGO gigante nell'angolo maxischermo-finestre
   const BOX_BANDIERINA=[[-.02,.22,.1,.53,-.04,.04]];     // asta e drappo (la buca è vicina al muro: la camera ci passa accanto)
   let legoRadice=null;
@@ -10293,6 +10640,7 @@ BUCHE[6]=(()=>{
     for(const M of pub) if(M.root.visible) lista.push([M.root,BOX_SEDUTO]);
     if(PR.mic.visible) lista.push([PR.mic,BOX_ASTA]);
     if(PR.baule.visible) lista.push([PR.baule,BOX_BAULE]);
+    if(PR.cordone.visible) lista.push([PR.cordone,BOX_CORDONE]);
     if(trovaLego()) lista.push([legoRadice,BOX_LEGO]);
     if(gFlag.visible) lista.push([gFlag,BOX_BANDIERINA]);
     for(const o of OCC.keys()) if(!lista.some(q=>q[0]===o)) lista.push([o,null]);
@@ -10312,7 +10660,7 @@ BUCHE[6]=(()=>{
   function opachi(){ for(const e of OCC.values()) for(const q of e.mesh){ if(q.x.material===q.c) q.x.material=q.orig; if(q.c) q.c.dispose(); } OCC.clear(); }
   function evento(e){
     if(e.tipo==='buca'){ pub.forEach((M,k)=>{ M.st.festa=.08*k; }); applauso(); }
-    else if(e.tipo==='trigger' && e.id==='emblema' && !G.emblema) pub.forEach((M,k)=>{ M.st.festa=.08*k; });
+    else if(e.tipo==='trigger' && e.id==='emblema' && !G.emblema){ pub.forEach((M,k)=>{ M.st.festa=.08*k; }); R.corda=0; }
     else if(e.tipo==='fermo' && G.p && !G.p.inBuca && !R.ooh && R.minD<.15){ R.ooh=true; ooh(); }
   }
   function esci(){
@@ -10325,6 +10673,7 @@ BUCHE[6]=(()=>{
     LG.ang=0; legoTesta(0);
     for(const c of CASE){ const M=PUB[c.id]; M.root.visible=false; M.st.festa=-1; }
     gFlag.rotation.z=0;
+    R.corda=-1; if(PR) PR.corda.rotation.x=0;
     S.attiva=false; S.daFirma=false; S.ts=0; S.prev=-1;
   }
 
@@ -10334,7 +10683,7 @@ BUCHE[6]=(()=>{
     disponi, mondo,
     props:{crea},
     firma:{durata:DUR, gestisceProps:true, prepara, stato, camera:cameraFirma},
-    ogniFrame, evento, esci
+    ogniFrame, evento, esci, luci:applicaLuci
   };
 })();
 
@@ -11347,11 +11696,11 @@ function passoFrame(dt){
     else if(G.fase==='trasforma') st.guarda=null;
     else if(G.fluEmb>0) st.guarda=gEmblema.position.clone().add(V(0,.5,0));
     else st.guarda=pallina.position.clone();
-    // quota sotto la mascotte: sul tavolo se lì c'è la pallina, altrimenti pavimento/rampa/dossi
+    // quota sotto la mascotte: con la pallina in alto sta sulla piattaforma che ha sotto i piedi (quella della
+    // pallina o una accanto: ponte, bancone), altrimenti pavimento/rampa/dossi
     if(G.mondo && G.fase!=='trasforma'){
-      const r=G.M.root.position, pl=G.p.liv===1?G.mondo.piattaforme.find(q=>q.id===G.p.plat):null;
-      const sopra=pl && FISICA.dentroRett(r.x,r.z,pl);
-      const hq=FISICA.terreno(G.mondo,r.x,r.z,sopra?1:0,sopra?pl.id:null).h;
+      const r=G.M.root.position, pl=G.p.liv===1?FISICA.piattaformaDi(G.mondo,r.x,r.z,G.p.plat):null;
+      const hq=FISICA.terreno(G.mondo,r.x,r.z,pl?1:0,pl?pl.id:null).h;
       st.baseY=(st.baseY||0)+(hq-(st.baseY||0))*Math.min(1,dt*12);
     }
     aggiornaMascotte(G.M,dt);
@@ -12136,6 +12485,953 @@ function passoFrame(dt){
   addEventListener('mousemove',muovi); muovi();
   const sveglia=async()=>{ try{ if(navigator.wakeLock && document.visibilityState==='visible') await navigator.wakeLock.request('screen'); }catch(e){} };
   document.addEventListener('visibilitychange',sveglia); sveglia();
+})();
+
+/* ---------------------------------------------------------------------
+   ATMOSFERA — la giornata in sette buche, il prato che si pettina, il ritorno del sole alla 7
+   Cosa fa
+   - Giornata: a ogni cambio buca il sole avanza di un'ora e mezza, dalle 9 (buca 1, la luce di oggi,
+     la stessa del menu) alle 18 della buca 7 (l'ora d'oro: ambra e oro, mai rosso). Nei primi 2 s del
+     cambio buca ruotano le ombre, i rettangoli di sole scivolano sul prato, i coni dei raggi cambiano
+     inclinazione e colore, la polvere si scalda e il cortile dietro le finestre va verso la sera.
+     Con una buca singola la luce raggiunge l'ora di quella buca durante il rotolo d'erba (o il cambio
+     buca, se il campo e' gia' steso). Al menu (e a 'riavvolto') torna la luce del laboratorio.
+   - Prato pettinato: quando la bandierina si pianta (1,0 s del cambio buca) dalla buca nuova parte
+     un'onda ad anello che in 0,8 s lascia dietro di se' l'erba falciata con un disegno nuovo:
+     2 strisce da 1 m lungo l'aula (a fase invertita rispetto a quelle dipinte), 3 trasversali,
+     4 scacchi, 5 diagonali, 6 cerchi intorno alla buca, 7 raggiera che converge sulla buca.
+   - Ritorno del sole alla 7: alla chiusura della 7 (qualunque punteggio) clunk e whoosh, le tende
+     risalgono, i LED si riaccendono e la luce d'oro torna piena in 0,6 s (la firma della 7 percorsa
+     all'indietro con la sua applicaLuci, esposta come BUCHE[6].luci). Con "Rigioca la buca" (che non
+     emette inizioBuca: si riconosce dal passaggio fine -> mira sulla 7) la 7 torna come nell'originale,
+     al buio con l'occhio di bue, in 0,9 s; alla nuova chiusura il sole ritorna di nuovo.
+   Tecnica (riusabile)
+   - Nessuna luce aggiunta o tolta (niente ricompilazioni): cambiano direzione e colore del sole e i
+     colori dell'emisfero. Le intensita' di sole, emisfero e polvere restano quelle del laboratorio,
+     cosi' la firma della 7, che le abbassa e in esci() rimette i valori salvati, non trova mai valori
+     diversi dai suoi.
+   - Chi governa cosa: le PointLight del soffitto appartengono alla buca 5 durante il suo cambio buca
+     (semaforo) e alla 7 finche' e' in gioco; qui si scrivono solo fuori da li', partendo dal valore
+     che hanno davvero (nessun salto). I raggi della 7 sono copie: il colore va su mesh.material, l'intensita'
+     sul materiale originale, che torna in scena con esci().
+   - Raggi: si riscrivono i vertici lontani dei 4 coni (solo durante il passaggio), troncati a pavimento e
+     parete delle porte: t=min(y/-d.y,(z-zP)/-d.z). SOLE_DIR e' mutabile: la polvere lo legge gia'.
+   - Cortile: un fondale gemello 1 cm davanti, ricavato UNA volta dai pixel del cortile di giorno
+     (cielo -> tramonto pesca e lilla, il resto -> dorato), che sfuma con l'opacita': nessun doppione.
+   - Prato: onBeforeCompile su matErba (una volta sola, stencil intatto). I motivi sono funzioni di (x,z)
+     del mondo con bordo morbido largo fwidth (antialias); uFronte(t) e' il raggio dell'onda; vicino al
+     foro mobile la modulazione va a zero. Le strisce gia' dipinte nella texture si neutralizzano col
+     rapporto medio delle due tinte, misurato una volta sul canvas.
+   --------------------------------------------------------------------- */
+(()=>{
+  const RID=typeof RIDOTTO!=='undefined' && RIDOTTO;
+  const T_SOLE=RID?.5:2, T_MENU=RID?0:.8, T_RIT7=RID?0:.6, TS7=2.64;   // durate; TS7: firma 7 a tende giu', prima dell'occhio di bue
+  const idxDi=b=>BUCHE.indexOf(b);
+
+  // ---------------- le sette ore ----------------
+  const raggiMat=raggi.children.length?raggi.children[0].material:null;
+  const r0=raggiMat?raggiMat.uniforms.uInt.value:.07;
+  const LUCI=scene.children.filter(o=>o.isPointLight && Math.abs(o.position.y-(AULA.h-.35))<.02);
+  const pl0=LUCI.length?LUCI[0].intensity:.32;
+  const C=h=>new THREE.Color(h), CR=(r,g,b)=>new THREE.Color(r,g,b);
+  // dir = direzione dei raggi (dal sole verso l'aula); i colori delle luci sono valori lineari come nell'originale
+  const ORE=[
+    {dir:SOLE_DIR.clone(),  sole:sole.color.clone(), cielo:emi.color.clone(), terra:emi.groundColor.clone(), raggi:r0,     rc:CR(1,.94,.82), cortile:0,   pl:pl0,      polv:CR(1,1,1)},   //  9.00 la luce di oggi
+    {dir:V(-2.6,-10.5,-11), sole:C(0xfff3e2),       cielo:C(0xe6f0ff),       terra:C(0xb39c88),             raggi:r0*.95, rc:CR(1,.95,.86), cortile:0,   pl:pl0,      polv:CR(1,1,1)},   // 10.30
+    {dir:V(-.4,-14,-10),    sole:C(0xfff8ee),       cielo:C(0xeaf2ff),       terra:C(0xb4a08c),             raggi:r0*.85, rc:CR(1,.97,.9),  cortile:0,   pl:pl0,      polv:CR(1,1,1)},   // 12.00 sole alto, ombre corte
+    {dir:V(2.2,-12,-11),    sole:C(0xfff1da),       cielo:C(0xeef0fa),       terra:C(0xb79c84),             raggi:r0*.9,  rc:CR(1,.93,.8),  cortile:0,   pl:pl0,      polv:CR(1,.97,.92)}, // 13.30
+    {dir:V(3.9,-9.5,-11),   sole:C(0xffe6c4),       cielo:C(0xf3ecf2),       terra:C(0xbc9a7e),             raggi:r0*1.05,rc:CR(1,.89,.72), cortile:.25, pl:pl0,      polv:CR(1,.93,.84)}, // 15.00
+    {dir:V(5.5,-7.2,-11),   sole:C(0xffd29c),       cielo:C(0xf2e2e4),       terra:C(0xc29a78),             raggi:r0*1.2, rc:CR(1,.82,.58), cortile:.62, pl:pl0*2.03, polv:CR(1,.88,.72)}, // 16.30 luce calda, LED piu' forti
+    {dir:V(6.9,-5,-11),     sole:C(0xffbf78),       cielo:C(0xf4dccf),       terra:C(0xc8946c),             raggi:r0*1.2, rc:CR(1,.76,.48),  cortile:1,   pl:pl0*2.03, polv:CR(1,.84,.62)}  // 18.00 l'ora d'oro
+  ];
+  for(const o of ORE) o.dir.normalize();
+  const N=ORE.length, CEN=V(CX,0,CZ);
+
+  // ---------------- raggi: colore come uniform, vertici lontani riscritti ----------------
+  if(raggiMat){
+    raggiMat.uniforms.uCol={value:ORE[0].rc.clone()};
+    raggiMat.fragmentShader='uniform float uInt; uniform vec3 uCol; varying float vA; void main(){ gl_FragColor=vec4(uCol,vA*vA*uInt); }';
+    raggiMat.needsUpdate=true;
+  }
+  const CONI=raggi.children.map(m=>{ const p=m.geometry.attributes.position;
+    return {m,p,W:[0,6,12,18].map(v=>[p.getX(v),p.getY(v),p.getZ(v)]),P:[[0,0,0],[0,0,0],[0,0,0],[0,0,0]]}; });
+  function aggiornaRaggi(){
+    const d=SOLE_DIR;
+    for(const c of CONI){
+      for(let k=0;k<4;k++){ const w=c.W[k], q=c.P[k];
+        let t=w[1]/Math.max(1e-4,-d.y); if(d.z<-1e-4) t=Math.min(t,(w[2]-AULA.zP)/-d.z);
+        q[0]=w[0]+d.x*t; q[1]=w[1]+d.y*t; q[2]=w[2]+d.z*t; }
+      // per ogni lato i del contorno: W[i],W[j],P[j], W[i],P[j],P[i]
+      for(let i=0;i<4;i++){ const j=(i+1)%4, b=i*6, Pj=c.P[j], Pi=c.P[i];
+        c.p.setXYZ(b+2,Pj[0],Pj[1],Pj[2]); c.p.setXYZ(b+4,Pj[0],Pj[1],Pj[2]); c.p.setXYZ(b+5,Pi[0],Pi[1],Pi[2]); }
+      c.p.needsUpdate=true; c.m.geometry.computeBoundingSphere();
+    }
+  }
+
+  // ---------------- cortile della sera: gemello del fondale, ricavato dai suoi pixel ----------------
+  const fondale=aula.children.find(o=>o.isMesh && o.geometry && o.geometry.parameters && o.geometry.parameters.width===26 && o.material && o.material.map);
+  let sera=null;
+  if(fondale){
+    try{
+      const src=fondale.material.map.image, W=1024, H=384, cv=mkCanvas(W,H), g=cv.getContext('2d',{willReadFrequently:true});
+      g.drawImage(src,0,0,W,H);
+      const im=g.getImageData(0,0,W,H), px=im.data;
+      const tinte=[[179,166,214],[226,184,196],[246,200,160],[255,222,160]];       // lilla, rosa cipria, pesca, oro (dall'alto)
+      const cielo=y=>{ const u=Math.min(.999,y/(H*.62))*(tinte.length-1), i=Math.floor(u), f=u-i, a=tinte[i], b=tinte[i+1];
+        return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f]; };
+      const sx=W*.16, sy=H*.5;                                                         // bagliore del sole, basso a ovest
+      for(let y=0;y<H;y++){ const cy=cielo(y);
+        for(let x=0;x<W;x++){ const i=(y*W+x)*4, r=px[i], gg=px[i+1], b=px[i+2], L=(r+gg+b)/3;
+          const s=Math.max(0,Math.min(1,(b-r+5)/30));                                  // quanto e' cielo (azzurro)
+          const k=.75+.45*L/255, d=Math.hypot(x-sx,(y-sy)*1.6)/(W*.3), gl=Math.max(0,1-d); const gl2=gl*gl*.55;
+          const cr=Math.min(255,cy[0]*k+255*gl2), cg=Math.min(255,cy[1]*k+214*gl2), cb=Math.min(255,cy[2]*k+150*gl2);
+          let dr=r*1.04+18, dg=gg*.9+6, db=b*.66;                                    // resto della scena: luce dorata
+          if(r>gg*1.5){ const m=(dr+dg+db)/3; dr=(dr+m)/2; dg=(dg+m)/2; db=(db+m)/2; }  // il tetto in cotto non vira al rosso
+          px[i]=cr*s+dr*(1-s); px[i+1]=cg*s+dg*(1-s); px[i+2]=cb*s+db*(1-s); px[i+3]=255; } }
+      g.putImageData(im,0,0);
+      sera=new THREE.Mesh(fondale.geometry,new THREE.MeshBasicMaterial({map:tex(cv),transparent:true,opacity:0,depthWrite:false,toneMapped:true}));
+      sera.position.copy(fondale.position); sera.rotation.copy(fondale.rotation); sera.position.z-=.01; sera.visible=false;
+      fondale.parent.add(sera);
+    }catch(e){ sera=null; }
+  }
+
+  // ---------------- applicaOra(k): k reale fra 0 (9.00) e 6 (18.00) ----------------
+  let kOra=0;
+  const _c=new THREE.Color();
+  function governaLuci(){                       // le PointLight del soffitto sono della buca 5 (cambio buca) o della 7
+    const b=BUCHE[G.bucaIdx]; if(!b || G.fase==='menu' || G.fase==='trasforma') return false;
+    return b.n===7 || (b.n===5 && G.fase==='transizione');
+  }
+  function applicaOra(k){
+    k=Math.max(0,Math.min(N-1,k)); kOra=k;
+    const i=Math.min(N-2,Math.floor(k)), f=k-i, A=ORE[i], B=ORE[i+1];
+    SOLE_DIR.copy(A.dir).lerp(B.dir,f).normalize();
+    sole.position.copy(CEN).addScaledVector(SOLE_DIR,-22);
+    sole.color.copy(A.sole).lerp(B.sole,f);
+    emi.color.copy(A.cielo).lerp(B.cielo,f); emi.groundColor.copy(A.terra).lerp(B.terra,f);
+    polvere.m.material.color.copy(A.polv).lerp(B.polv,f);
+    if(raggiMat){
+      raggiMat.uniforms.uInt.value=A.raggi+(B.raggi-A.raggi)*f;
+      _c.copy(A.rc).lerp(B.rc,f); raggiMat.uniforms.uCol.value.copy(_c);
+      for(const c of CONI){ const u=c.m.material.uniforms; if(u && u.uCol) u.uCol.value.copy(_c); }   // anche le copie della 7
+      aggiornaRaggi();
+    }
+    if(sera){ const o=A.cortile+(B.cortile-A.cortile)*f; sera.material.opacity=o; sera.visible=o>.003; }
+  }
+  // PointLight: dal valore che hanno davvero al valore dell'ora d'arrivo, solo se nessuna buca le governa
+  const PL={da:LUCI.map(l=>l.intensity), a:pl0};
+  function plParti(kA){ for(let i=0;i<LUCI.length;i++) PL.da[i]=LUCI[i].intensity; PL.a=ORE[Math.round(kA)].pl; }
+  function plScrivi(e){ if(governaLuci()) return; for(let i=0;i<LUCI.length;i++) LUCI[i].intensity=PL.da[i]+(PL.a-PL.da[i])*e; }
+
+  // ---------------- prato pettinato ----------------
+  const U={uMotV:{value:0},uMotN:{value:0},uFronte:{value:99},uOnda:{value:0},uContrasto:{value:.10},
+    uCentroV:{value:new THREE.Vector2()},uCentroN:{value:new THREE.Vector2()},uForo:{value:new THREE.Vector2(99,99)},
+    uKChiaro:{value:new THREE.Vector3(1,1,1)},uKScuro:{value:new THREE.Vector3(1,1,1)}};
+  // tinte medie delle due fasce dipinte nella texture (lineari): v<0,5 = meta' bassa del canvas (flipY) = fascia scura
+  try{
+    const im=matErba.map.image, W=im.width, cv=mkCanvas(W,96), g=cv.getContext('2d',{willReadFrequently:true}), lin=new Float32Array(256);
+    for(let i=0;i<256;i++){ const c=i/255; lin[i]=c<=.04045?c/12.92:Math.pow((c+.055)/1.055,2.4); }
+    g.drawImage(im,0,Math.round(im.height*.12),W,48,0,0,W,48); g.drawImage(im,0,Math.round(im.height*.62),W,48,0,48,W,48);
+    const d=g.getImageData(0,0,W,96).data;                                       // una sola lettura: due strisce da 48 righe
+    const media=r0=>{ const m=[0,0,0]; for(let i=r0*W*4;i<(r0+48)*W*4;i+=4){ m[0]+=lin[d[i]]; m[1]+=lin[d[i+1]]; m[2]+=lin[d[i+2]]; } return m.map(v=>v/(48*W)); };
+    const ch=media(0), sc=media(48);
+    U.uKChiaro.value.set((ch[0]+sc[0])/2/ch[0],(ch[1]+sc[1])/2/ch[1],(ch[2]+sc[2])/2/ch[2]);
+    U.uKScuro.value.set((ch[0]+sc[0])/2/sc[0],(ch[1]+sc[1])/2/sc[1],(ch[2]+sc[2])/2/sc[2]);
+  }catch(e){}
+  matErba.onBeforeCompile=sh=>{
+    Object.assign(sh.uniforms,U);
+    sh.vertexShader=sh.vertexShader.replace('#include <common>','#include <common>\nvarying vec2 vM;')
+      .replace('#include <project_vertex>','#include <project_vertex>\nvM=(modelMatrix*vec4(transformed,1.0)).xz;');
+    sh.fragmentShader=sh.fragmentShader.replace('#include <common>',`#include <common>
+varying vec2 vM;
+uniform float uMotV,uMotN,uFronte,uOnda,uContrasto; uniform vec2 uCentroV,uCentroN,uForo; uniform vec3 uKChiaro,uKScuro;
+float strisciaP(float s,float w){ return smoothstep(-w,w,sin(3.14159265*s)*.31830989); }
+float motivoP(float id,vec2 p,vec2 c,float w){
+  if(id<.5) return -1.;
+  if(id<1.5) return strisciaP(p.y,w);
+  if(id<2.5) return strisciaP(p.x,w);
+  if(id<3.5){ float a=strisciaP(p.x,w), b=strisciaP(p.y,w); return a*b+(1.-a)*(1.-b); }
+  if(id<4.5) return strisciaP((p.x+p.y)*.70710678,w);
+  vec2 d=p-c; float r=length(d);
+  if(id<5.5) return strisciaP(r,w);
+  if(r<1e-3) return .5;
+  return smoothstep(-w,w,sin(12.*atan(d.y,d.x))*r*.0833333);
+}`).replace('#include <map_fragment>',`#include <map_fragment>
+#ifdef USE_MAP
+{
+  vec2 fw=fwidth(vM); float w=.012+.75*max(fw.x,fw.y);
+  float fy=fract(vUv.y), wu=.6*fwidth(vUv.y)+.001;
+  float scuro=smoothstep(-wu,wu,fy)-smoothstep(.5-wu,.5+wu,fy)+smoothstep(1.-wu,1.+wu,fy);
+  vec3 neutro=mix(uKChiaro,uKScuro,scuro);
+  float a=motivoP(uMotV,vM,uCentroV,w), b=motivoP(uMotN,vM,uCentroN,w);
+  vec3 fa=a<0.?vec3(1.):neutro*(1.+uContrasto*(2.*a-1.));
+  vec3 fb=b<0.?vec3(1.):neutro*(1.+uContrasto*(2.*b-1.));
+  float dN=length(vM-uCentroN), x=(dN-uFronte)/.22;
+  vec3 f=mix(fa,fb,1.-smoothstep(uFronte-.05,uFronte+.05,dN))*(1.+uOnda*.08*exp(-x*x));
+  diffuseColor.rgb*=mix(vec3(1.),f,smoothstep(.12,.35,length(vM-uForo)));
+}
+#endif`);
+  };
+  matErba.needsUpdate=true;
+  let motOra=0;
+  const centroDi=i=>BUCHE[i] && BUCHE[i].buca ? BUCHE[i].buca : {x:CX,z:CZ};
+  function pratoFisso(i){ motOra=i; const c=centroDi(i); U.uMotV.value=U.uMotN.value=i;
+    U.uCentroV.value.set(c.x,c.z); U.uCentroN.value.set(c.x,c.z); U.uFronte.value=99; U.uOnda.value=0; }
+  function pratoParti(i,cx,cz){ const cv=centroDi(motOra), cn=centroDi(i);
+    U.uMotV.value=motOra; U.uCentroV.value.set(cv.x,cv.z); U.uMotN.value=i; U.uCentroN.value.set(cx!==undefined?cx:cn.x,cz!==undefined?cz:cn.z);
+    U.uFronte.value=-1; U.uOnda.value=0; }
+  function pratoOnda(u){                                    // u: 0..1 della corsa dell'onda
+    if(u>=1){ motOra=U.uMotN.value; U.uMotV.value=motOra; U.uCentroV.value.copy(U.uCentroN.value); U.uFronte.value=99; U.uOnda.value=0; return; }
+    if(u<=0){ U.uFronte.value=-1; U.uOnda.value=0; return; }
+    U.uFronte.value=16*ease(u); U.uOnda.value=Math.sin(Math.PI*u);
+  }
+
+  // ---------------- regia: transizioni di luce e prato ----------------
+  const A={modo:null, da:0, a:0, t:0, dur:1, prato:false};
+  let ultimaTrasf=null;
+  const R7={attivo:false, pieno:false, t:0, buio:-1, fase:''};
+  function finisci(){ if(!A.modo) return; applicaOra(A.a); plScrivi(1); if(A.prato) pratoOnda(1); A.modo=null; }
+  function parti(modo,a,dur){ A.modo=modo; A.da=kOra; A.a=a; A.t=0; A.dur=dur; A.prato=false; plParti(a); }
+
+  suEvento('cambioBuca',(T,prima,b)=>{
+    const i=idxDi(b); if(i<0) return;
+    if(A.prato) pratoOnda(1);
+    R7.attivo=false; R7.pieno=false; R7.buio=-1;
+    parti('trans',i,T_SOLE);
+    pratoParti(i); A.prato=true;
+  });
+  suEvento('transizione',(T,t)=>{
+    if(A.modo!=='trans') return;
+    const u=clamp01(t/A.dur), e=ease(u);
+    if(A.t<1){ applicaOra(A.da+(A.a-A.da)*e); plScrivi(e); A.t=u; }
+    if(A.prato) pratoOnda(RID?(t>=1?1:0):clamp01((t-1)/.8));
+    if(A.t>=1 && (!A.prato || U.uFronte.value>=99)){ A.modo=null; A.prato=false; }
+  });
+  suEvento('inizioBuca',b=>{
+    const i=idxDi(b); if(i<0) return;
+    if(A.modo) finisci();
+    else if(Math.abs(kOra-i)>1e-3){ plParti(i); applicaOra(i); plScrivi(1); }   // (avvio senza rotolo con riduzione del movimento)
+    if(motOra!==i || U.uFronte.value<99) pratoFisso(i);
+  });
+  suEvento('menu',()=>{
+    R7.attivo=false; R7.pieno=false; R7.buio=-1;
+    if(T_MENU<=0){ A.modo=null; plParti(0); applicaOra(0); plScrivi(1); pratoFisso(0); return; }
+    if(A.prato) pratoOnda(1);
+    parti('tempo',0,T_MENU);
+    pratoParti(0,gBuca.position.x,gBuca.position.z); A.prato=true;
+  });
+  suEvento('riavvolto',()=>{ A.modo=null; A.prato=false; R7.attivo=false; R7.pieno=false; R7.buio=-1; plParti(0); applicaOra(0); plScrivi(1); pratoFisso(0); });
+  suEvento('chiusa',({b})=>{
+    if(!b || b.n!==7 || R7.pieno || typeof b.luci!=='function') return;
+    R7.attivo=true; R7.pieno=true; R7.t=0;
+    try{ tono(80,.22,'sine',.12); rumore(.1,.1,300); rumore(.4,.08,900,.04); }catch(e){}
+    b.luci(RID?0:TS7);
+  });
+  suEvento('frame',(dt)=>{
+    U.uForo.value.set(gBuca.position.x,gBuca.position.z);
+    // partenza dal menu col rotolo d'erba: prato gia' pettinato, luce verso l'ora della buca
+    if(G.fase==='trasforma' && G.trasf && G.trasf!==ultimaTrasf){
+      ultimaTrasf=G.trasf; R7.attivo=false; R7.pieno=false; R7.buio=-1; A.prato=false;
+      pratoFisso(G.bucaIdx); parti('trasf',G.bucaIdx,RID?.5:2.4);
+    }
+    if(A.modo==='trasf'){
+      if(G.fase!=='trasforma' || !G.trasf) finisci();
+      else { const e=ease(clamp01((G.trasf.t-.6)/A.dur)); applicaOra(A.da+(A.a-A.da)*e); plScrivi(e); if(e>=1) A.modo=null; }
+    } else if(A.modo==='tempo'){
+      A.t+=dt; const u=clamp01(A.t/A.dur), e=ease(u);
+      applicaOra(A.da+(A.a-A.da)*e); plScrivi(e); if(A.prato) pratoOnda(u);
+      if(u>=1){ A.modo=null; A.prato=false; }
+    }
+    // "Rigioca la buca" sulla 7: la scena torna al buio (tende, LED, occhio di bue: la firma da 1,15 a 2,85 s)
+    const b7=BUCHE[G.bucaIdx], in7=!!b7 && b7.n===7 && G.fase!=='menu' && G.fase!=='transizione' && G.fase!=='trasforma';
+    if(R7.pieno && R7.fase==='fine' && G.fase==='mira' && in7){ R7.attivo=false; R7.pieno=false; R7.buio=RID?1:0; }
+    R7.fase=G.fase;
+    if(R7.buio>=0){
+      if(!in7) R7.buio=-1;
+      else { const p=R7.buio; R7.buio=Math.min(1,p+dt/.9);
+        if(p<.88 && R7.buio>=.88) try{ tono(80,.22,'sine',.12); rumore(.1,.1,300); }catch(e){}
+        b7.luci(1.15+1.7*R7.buio); if(R7.buio>=1) R7.buio=-1; }
+    }
+    // ritorno del sole alla 7: la firma all'indietro, poi tiene la luce piena finche' la 7 potrebbe ancora riscriverla
+    if(R7.attivo){
+      const b=BUCHE[G.bucaIdx];
+      if(!b || b.n!==7 || G.fase==='menu' || G.fase==='transizione' || G.fase==='trasforma'){ R7.attivo=false; return; }
+      R7.t+=dt; const u=T_RIT7>0?clamp01(R7.t/T_RIT7):1;
+      b.luci(TS7*(1-ease(u)));
+      if(R7.t>6) R7.attivo=false;
+    }
+  });
+})();
+
+/* --------------------------------------------------------------------
+   FINALE (blocco EXTRA "finale") — i due momenti che chiudono il percorso.
+   1) BUCA 7, IL CANESTRO FINALE. Pallina in buca alla 7 (qualunque punteggio): nei 2,2 s
+      che passano tra chiudiBuca e il riquadro risultato il foro la risputa con un pop, lei
+      vola ad arco sopra la quinta ovest e scende pulita nel mini canestro della parete
+      (x -5,1) con lo swish e la retina che si scuote; poi due rimbalzi (il primo scavalca
+      il baule di scena) e rotola ai piedi della mascotte, che esulta. Solo grafica: G.p e
+      FISICA non cambiano. La luce che torna è del blocco atmosfera. Clic o Invio mostrano
+      subito il riepilogo.
+   2) LA STATUINA STAMPATA. In modalità percorso "Vedi il cartellino" (btnFineGiro, anche
+      con Invio dal riquadro) non apre subito il cartellino: la camera vola al bancone, la
+      stampante 3D stampa a strati da 3 mm la statuina (18 cm) della mascotte del giocatore,
+      tutta nel colore della tunica come una stampa monocolore; al tin finale prende i suoi
+      colori con un lampo, sbatte le palpebre, fa due salti e alza la mazza; poi il
+      cartellino. Blocca 5,5 s; clic o Invio la saltano.
+   TECNICA (riusabile)
+   - Tutto è funzione del tempo t (statoCanestro, statoStatuina): saltare = portare t alla
+     fine e applicare lo stato; i suoni sono eventi "a soglia" (scattano quando t supera il
+     loro istante) e nel salto tacciono.
+   - Pallina "di scena": in fase 'fine' passoFrame la rimette in G.p a ogni fotogramma;
+     l'aggancio 'frame' (dopo passoFrame, prima del render) la sposta dove deve stare, con un
+     quaternione proprio (la rotazione di passoFrame viene scartata) e l'ombra a contatto.
+   - Arco: in pianta s(u)=u+.6u(1-u) (frena verso il canestro), in quota y=y0+Au-Bu²
+     con y(1)=2,27 m e apice 2,80 m (la quinta è alta 2,64): B è la radice grande di
+     B²+(2D1-4Dm)B+D1²=0. Nella retina un tratto di Hermite cubico la rallenta; poi caduta e
+     rimbalzi y=R+4h·v(1-v) con gravità da cartone (1,8 g).
+   - Retina: scala (1-.07s, 1+.16s, 1-.07s) con s=sin(22τ)·e^(-5τ), ancorata al cerchio.
+   - Camera: in 'fine' aggiornaCamera la riporterebbe dietro la pallina; l'aggancio 'frame' la
+     reimposta dopo, e tiene aggiornato lookCorrente così il ritorno al gioco è morbido.
+   - Statuina: mkMascotte(casa) dentro un supporto scalato .45 sul piatto. I materiali originali
+     vanno in una Map e sono sostituiti da un unico MeshStandardMaterial con clippingPlanes
+     [piano orizzontale] e clipShadows; il piano sale a scatti di 3 mm (renderer.
+     localClippingEnabled solo durante la stampa). DoubleSide: l'interno tagliato sembra il
+     riempimento. Precompilazione: un fotogramma di riscaldamento con tutto visibile ma tagliato
+     via (al caricamento e 1 s dopo l'inizio della buca 7 del percorso, con le luci di quel
+     momento) compila shader e ombra: nessuno scatto quando parte la stampa. La copia di
+     Cerogiallo nasce senza la PointLight della candela (il numero di luci non cambia mai).
+   - Stampante: come nella buca 6, una copia con telaio, asse X, carrello, piatto e bobina mobili
+     sostituisce per la durata la mesh unita originale; il piatto scorre in z (bed slinger).
+   - Riepilogo anticipato: il setTimeout di chiudiBuca non si può annullare; fino allo scatto del timer (max 60 s) un MutationObserver
+     sulla classe di #risultato lo richiude se riappare fuori da 'fine' (o sopra cartellino/menu/statuina).
+   - Tutto sparisce al 'menu', al 'cambioBuca' e quando la fase lascia 'fine' (Rigioca).
+   -------------------------------------------------------------------- */
+(()=>{
+  const PI=Math.PI, R=FISICA.COST.R, mix=(a,b,u)=>a+(b-a)*u;
+  const nascosto=id=>$(id).classList.contains('nascosto');
+  // Riepilogo in anticipo (clic/Invio sul canestro). Il timer di chiudiBuca (2,2 s) non si può annullare e lo
+  // riaprirebbe anche dopo un Rigioca/Menu/Vedi il cartellino rapidi: un MutationObserver, attivo solo in quella
+  // finestra (fino alla riapertura abusiva, alla chiusa seguente o al massimo 60 s), lo richiude prima del disegno e rimette l'HUD se si sta già giocando.
+  const ANT={t0:0, oss:null, max:60000};   // 60 s: in una scheda in secondo piano Chrome può ritardare molto il timer
+  function guardiaFine(){ if(ANT.oss){ ANT.oss.disconnect(); ANT.oss=null; } }
+  function guardiaRiepilogo(){
+    if(ANT.oss) return;
+    ANT.oss=new MutationObserver(()=>{
+      if(performance.now()-ANT.t0>ANT.max){ guardiaFine(); return; }
+      if(nascosto('risultato')) return;
+      if(G.fase==='fine' && !S.attiva && !S.esposta && nascosto('cartellino') && nascosto('menu')) return;   // riapertura lecita
+      $('risultato').classList.add('nascosto');
+      if(G.fase==='mira'||G.fase==='carica'||G.fase==='swing'||G.fase==='rotola') mostraGioco(true);
+      guardiaFine();                                         // il timer scatta una volta sola
+    });
+    ANT.oss.observe($('risultato'),{attributes:true,attributeFilter:['class']});
+  }
+  function mostraRiepilogo(){ $('risultato').classList.remove('nascosto'); mostraGioco(false); if(document.pointerLockElement) document.exitPointerLock(); guardiaRiepilogo(); }
+
+  /* ================= 1. IL CANESTRO FINALE (buca 7) ================= */
+  const CAN={x:-5.1, z:AULA.zP+.27, yH:2.27, yApice:2.80, yUscita:1.66};   // cerchio a y 2,05; fondo retina 1,71
+  const TP=.42, TA=.68, TN=.22, GF=9.81*1.8, V_USCITA=1.4, T_CAM=.5;
+  const L2A={x:CAN.x-.12, z:CAN.z+1.33};     // primo rimbalzo: scavalca il baule, atterra davanti al palco tra le sedie
+  // camera ferma a ovest del palco (da lì il canestro sta davanti alla quinta, non dietro) che segue la pallina con lo sguardo
+  const CAM_C=new THREE.Vector3(-6.0,1.45,-.45), ANCORA=new THREE.Vector3(-4.45,1.2,-2.4);
+  // alone dorato attorno alla pallina in volo: sul muro chiaro una pallina bianca da 5 cm si perderebbe
+  const cA=mkCanvas(64,64), gA=cA.getContext('2d'), grA=gA.createRadialGradient(32,32,0,32,32,32);
+  grA.addColorStop(0,'rgba(255,250,232,1)'); grA.addColorStop(.35,'rgba(255,224,150,.5)'); grA.addColorStop(1,'rgba(255,210,120,0)');
+  gA.fillStyle=grA; gA.fillRect(0,0,64,64);
+  const TEX_ALONE=tex(cA);
+  const alone=new THREE.Sprite(new THREE.SpriteMaterial({map:TEX_ALONE,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,toneMapped:false,opacity:0}));
+  alone.visible=false; alone.scale.setScalar(.11); scene.add(alone);
+  let rete=null;
+  for(const o of aula.children) if(o.isMesh && o.geometry && o.geometry.type==='CylinderGeometry'
+     && o.geometry.parameters.radiusTop===.19 && Math.abs(o.position.x-CAN.x)<.01) rete=o;
+  const RETE_Y=rete?rete.position.y:0, RETE_TOP=RETE_Y+.17;
+  const OMB0=ombraPallina.scale.clone();
+  const F={on:false, esposto:false, t:0, prev:0, muto:false, flag:false,
+    P0:new THREE.Vector3(), H:new THREE.Vector3(), A:0, B:0, L1:{x:0,z:0}, L2:{x:0,z:0}, L3:{x:0,z:0}, T:{x:0,z:0},
+    h1:.6, h2:.1, tN:0, tF:0, t1:0, t2:0, t3:0, d1:0, d2:0, dr:0, fine:0,
+    camDa:new THREE.Vector3(), lookDa:new THREE.Vector3(), look:new THREE.Vector3(), q:new THREE.Quaternion(), ult:new THREE.Vector3(), primo:true, salto:false};
+  const _p=new THREE.Vector3(), _ax=new THREE.Vector3(), _t=new THREE.Vector3();
+
+  function avviaCanestro(){
+    if(!G.p || !G.M) return;
+    F.on=true; F.esposto=false; F.t=0; F.prev=0; F.muto=false; F.primo=true; F.salto=true;
+    G.vistaAlto=false;
+    F.camDa.copy(camera.position); F.lookDa.copy(lookCorrente); F.camDa.y=Math.min(F.camDa.y,AULA.h-.4);   // (dalla vista dall'alto: sotto il soffitto)
+    F.P0.set(G.p.x+.028, R+(G.p.h||0)-.072, G.p.z);                 // dove la lascia la discesa nel foro
+    const dx=CAN.x-G.p.x, dz=CAN.z-G.p.z, d=Math.hypot(dx,dz)||1;
+    F.H.set(CAN.x-.04*dx/d, CAN.yH, CAN.z-.04*dz/d);                 // fine arco: 4 cm prima del centro del cerchio
+    const y0=F.P0.y, D1=CAN.yH-y0, Dm=CAN.yApice-y0, k=4*Dm-2*D1;
+    F.B=(k+Math.sqrt(Math.max(0,k*k-4*D1*D1)))/2; F.A=D1+F.B;
+    // rimbalzi: fuori dalla tasca (sopra il baule) verso la mascotte; se la mascotte è nella tasca, restano lì
+    F.L1.x=CAN.x; F.L1.z=CAN.z;
+    const m=G.M.st.meta, inTasca=m.x<-4.78 && m.x>-5.65 && m.z<AULA.zP+.7;
+    const Lp=inTasca?F.L1:L2A;
+    let ux=Lp.x-m.x, uz=Lp.z-m.z; const lu=Math.hypot(ux,uz)||1; ux/=lu; uz/=lu;
+    F.T.x=m.x+ux*.17; F.T.z=m.z+uz*.17;                              // ai piedi, dal lato da cui arriva
+    if(inTasca){ F.h1=.28; F.h2=.07; F.L2.x=mix(F.L1.x,F.T.x,.45); F.L2.z=mix(F.L1.z,F.T.z,.45); F.L3.x=mix(F.L1.x,F.T.x,.75); F.L3.z=mix(F.L1.z,F.T.z,.75); }
+    else { F.h1=.6; F.h2=.1; F.L2.x=L2A.x; F.L2.z=L2A.z;
+      const dd=Math.hypot(F.T.x-F.L2.x,F.T.z-F.L2.z), s=dd>.75?.45/dd:.4; F.L3.x=mix(F.L2.x,F.T.x,s); F.L3.z=mix(F.L2.z,F.T.z,s); }
+    F.tN=TP+TA; F.tF=F.tN+TN;
+    F.t1=F.tF+(-V_USCITA+Math.sqrt(V_USCITA*V_USCITA+2*GF*(CAN.yUscita-R)))/GF;
+    F.d1=2*Math.sqrt(2*F.h1/GF); F.d2=2*Math.sqrt(2*F.h2/GF); F.t2=F.t1+F.d1; F.t3=F.t2+F.d2;
+    const Dr=Math.hypot(F.T.x-F.L3.x,F.T.z-F.L3.z), vin=Math.hypot(F.L3.x-F.L2.x,F.L3.z-F.L2.z)/F.d2;
+    F.dr=Math.min(1.6,Math.max(.35,2*Dr/Math.max(.3,vin)));
+    F.fine=RIDOTTO?F.t1:F.t3+F.dr;
+  }
+  // posizione della pallina di scena al tempo t (false = ancora nel foro: decide passoFrame)
+  function posCanestro(t,p){
+    if(t<TP) return false;
+    if(t<F.tN){ const u=(t-TP)/TA, s=u+.6*u*(1-u);
+      p.set(mix(F.P0.x,F.H.x,s), F.P0.y+F.A*u-F.B*u*u, mix(F.P0.z,F.H.z,s)); return true; }
+    if(t<F.tF){ const k=(t-F.tN)/TN, k2=k*k, k3=k2*k, v0=(F.A-2*F.B)/TA, e=1-(1-k)*(1-k);      // nella retina: Hermite
+      p.set(mix(F.H.x,CAN.x,e), (2*k3-3*k2+1)*CAN.yH+(k3-2*k2+k)*TN*v0+(3*k2-2*k3)*CAN.yUscita-(k3-k2)*TN*V_USCITA, mix(F.H.z,CAN.z,e)); return true; }
+    if(t<F.t1 || RIDOTTO){ const tt=Math.min(t,F.t1)-F.tF; p.set(CAN.x, Math.max(R,CAN.yUscita-V_USCITA*tt-.5*GF*tt*tt), CAN.z); return true; }
+    if(t<F.t2){ const v=(t-F.t1)/F.d1; p.set(mix(F.L1.x,F.L2.x,v), R+4*F.h1*v*(1-v), mix(F.L1.z,F.L2.z,v)); return true; }
+    if(t<F.t3){ const v=(t-F.t2)/F.d2; p.set(mix(F.L2.x,F.L3.x,v), R+4*F.h2*v*(1-v), mix(F.L2.z,F.L3.z,v)); return true; }
+    const k=Math.min(1,(t-F.t3)/F.dr), e=1-(1-k)*(1-k);
+    p.set(mix(F.L3.x,F.T.x,e), R, mix(F.L3.z,F.T.z,e)); return true;
+  }
+  function statoCanestro(dt){
+    const t=F.t, passa=a=>F.prev<a && t>=a && !F.muto, vola=posCanestro(t,_p);
+    // camera: in 0,5 s raggiunge il suo posto, poi resta ferma e segue la pallina con lo sguardo (morbido)
+    if(!vola) _p.copy(F.P0);
+    _t.copy(ANCORA).lerp(_p,.7);
+    if(F.salto){ F.look.copy(_t); F.salto=false; } else F.look.lerp(_t,Math.min(1,dt*6));
+    if(!S.attiva && !S.esposta){
+      const w=RIDOTTO?1:ease(clamp01(t/T_CAM));
+      camera.position.lerpVectors(F.camDa,CAM_C,w); lookCorrente.lerpVectors(F.lookDa,F.look,w); camera.lookAt(lookCorrente);
+    }
+    // alone: dal pop fin quasi alla fine del rotolamento
+    const ka=clamp01((t-TP)/.12)*clamp01((F.fine-t)/.5);
+    alone.visible=vola && ka>0; if(alone.visible){ alone.position.copy(_p); alone.material.opacity=.7*ka; }
+    // pallina di scena, con rotazione propria e ombra a contatto
+    if(vola){
+      if(F.primo){ F.primo=false; F.q.copy(pallina.quaternion); F.ult.copy(_p); }
+      const dx=_p.x-F.ult.x, dz=_p.z-F.ult.z, d=Math.hypot(dx,dz);
+      pallina.quaternion.copy(F.q);
+      if(d>1e-6 && d<1){ _ax.set(dz,0,-dx).normalize(); pallina.rotateOnWorldAxis(_ax,d/R); }
+      F.q.copy(pallina.quaternion); F.ult.copy(_p);
+      pallina.position.copy(_p);
+      const hy=_p.y-R; ombraPallina.visible=pallina.visible && hy<.9;
+      ombraPallina.position.set(_p.x,.009,_p.z); ombraPallina.scale.set(OMB0.x*(1+hy*1.3),1,OMB0.z*(1+hy*1.3));
+    }
+    // bandierina: vibra quando la pallina le schizza accanto
+    const tf=t-TP;
+    if(!RIDOTTO && tf>=0 && tf<1.1){ gFlag.rotation.z=.1*Math.sin(32*tf)*Math.exp(-6*tf); F.flag=true; }
+    else if(F.flag){ gFlag.rotation.z=0; F.flag=false; }
+    // retina: si scuote quando passa la pallina (ancorata al cerchio)
+    if(rete){ const tr=t-(F.tN+.045);
+      if(!RIDOTTO && tr>=0 && tr<1.3){ const s=Math.sin(22*tr)*Math.exp(-5*tr); rete.scale.set(1-.07*s,1+.16*s,1-.07*s); rete.position.y=RETE_TOP-.17*(1+.16*s); }
+      else if(rete.scale.y!==1){ rete.scale.set(1,1,1); rete.position.y=RETE_Y; } }
+    // suoni a soglia
+    if(passa(TP)) tono(300,.06,'sine',.12,0,640);                                        // pop
+    if(passa(F.tN)){ rumore(.22,.16,3200,.03); tono(1800,.12,'sine',.03,.03,900);       // swish
+      let o=.12; for(let i=0;i<6;i++){ rumore(.05,.05+Math.random()*.03,1400+Math.random()*800,o); o+=.04+Math.random()*.05; } }   // applauso
+    if(!RIDOTTO){
+      if(passa(F.t1)){ tono(230,.07,'triangle',.09); rumore(.03,.05,1500); }
+      if(passa(F.t2)){ tono(260,.05,'triangle',.05); }
+      if(F.prev<F.fine && t>=F.fine){ if(G.M) G.M.st.festa=0; if(G.C) G.C.festa=0; }     // ai suoi piedi: esulta
+    } else if(passa(F.t1)) tono(230,.07,'triangle',.07);
+  }
+  function frameCanestro(dt){
+    if(!F.on && !F.esposto) return;
+    if(G.fase!=='fine'){ chiudiCanestro(); return; }
+    if(F.on){ F.prev=F.t; F.t=Math.min(F.fine,F.t+dt); }
+    statoCanestro(dt);
+    if(F.on && F.t>=F.fine){ F.on=false; F.esposto=true; }
+  }
+  function finisciCanestro(){
+    if(!F.on) return;
+    F.muto=true; F.salto=true; F.prev=F.t; F.t=F.fine; statoCanestro(0); F.on=false; F.esposto=true;
+  }
+  function chiudiCanestro(){
+    if(!F.on && !F.esposto) return;
+    F.on=F.esposto=false; alone.visible=false;
+    if(rete){ rete.scale.set(1,1,1); rete.position.y=RETE_Y; }
+    ombraPallina.scale.copy(OMB0);
+    if(F.flag){ gFlag.rotation.z=0; F.flag=false; }
+  }
+
+  /* ================= 2. LA STATUINA STAMPATA ================= */
+  const BAN=AULA.bancone, XS=BAN.x0+.95, YS=BAN.h, ZS=AULA.zP+.3, YP=YS+.106;   // stampante del bancone; YP = piano del piatto
+  const SCALA=.45, STRATO=.003, DUR_S=RIDOTTO?2:5.5;
+  const TS={vola:1.2, parte:1.2, stampa0:1.4, stampa1:4.05, park:4.2, tin:4.2, sveglia:4.35};
+  const PARK={x:XS+.05, y:YS+.42};
+  // camera a ovest della stampante, lungo il bancone: sullo sfondo, in fondo all'aula, la vetrata delle mele.
+  // Arriva in pos e durante la stampa si avvicina piano fino a vicino.
+  const CAM_S={pos:new THREE.Vector3(XS-.85,YS+.55,ZS+.28), vicino:new THREE.Vector3(XS-.45,YS+.38,ZS+.15),
+               look:new THREE.Vector3(XS+.02,YS+.2,ZS+.02), P2:new THREE.Vector3(XS-.75,YS+.9,ZS+2.0)};
+  const YAW_S=Math.atan2(CAM_S.vicino.x-XS,CAM_S.vicino.z-ZS)+.3;   // di tre quarti verso la camera
+  // la stampante originale è una mesh unita: si cercano telaio, bobina e piatto per sostituirli con una copia mobile
+  const ORIG={telaio:null, bobina:null, piatto:null};
+  for(const o of aula.children){
+    if(!o.isMesh || !o.geometry || !o.geometry.attributes.position) continue;
+    const gg=o.geometry, p=o.position;
+    if(gg.type==='TorusGeometry' && Math.abs(p.x-XS)<.01 && Math.abs(p.y-(YS+.72))<.01) ORIG.bobina=o;
+    else if(Math.abs(p.x-XS)<.01 && Math.abs(p.y-(YS+.1))<.01 && Math.abs(p.z-ZS)<.01) ORIG.piatto=o;
+    else if(p.lengthSq()<1e-12 && gg.attributes.position.count<30000){
+      if(!gg.boundingBox) gg.computeBoundingBox(); const q=gg.boundingBox;
+      if(Math.abs(q.min.y-YS)<.01 && Math.abs(q.max.y-(YS+.63))<.01 && Math.abs((q.min.x+q.max.x)/2-XS)<.02 && Math.abs((q.min.z+q.max.z)/2-ZS)<.03) ORIG.telaio=o;
+    }
+  }
+  const okStampa=!!(ORIG.telaio && ORIG.bobina && ORIG.piatto);
+  const gS=new THREE.Group(); gS.name='finale_stampante';
+  const PIANO=new THREE.Plane(new THREE.Vector3(0,-1,0),0);         // tiene y <= constant
+  const matStampa=new THREE.MeshStandardMaterial({color:0xffffff,roughness:.55,metalness:0,side:THREE.DoubleSide,clippingPlanes:[PIANO],clipShadows:true});
+  const mFilo=new THREE.MeshStandardMaterial({color:0xffffff,roughness:.5});
+  const _Y=new THREE.Vector3(0,1,0), _d=new THREE.Vector3(), _a=new THREE.Vector3(), _b=new THREE.Vector3();
+  let piatto=null, holder=null, carr=null, asseX=null, bob=null, filo=null, led=null, punta=null, lampo=null;
+  const prove=[];
+  if(okStampa){
+    const mNero=ORIG.telaio.material;
+    add(unisci([pezzo(rbox(.44,.09,.44,.012,2),XS,YS+.045,ZS), pezzo(rbox(.05,.52,.05,.006,2),XS-.2,YS+.35,ZS-.06),
+      pezzo(rbox(.05,.52,.05,.006,2),XS+.2,YS+.35,ZS-.06), pezzo(rbox(.46,.06,.06,.008,2),XS,YS+.6,ZS-.06)]),mNero,gS).castShadow=true;
+    asseX=add(rbox(.36,.022,.026,.006,2),mNero,gS,XS,PARK.y,ZS-.06); asseX.castShadow=true;
+    carr=new THREE.Group(); carr.position.set(PARK.x,PARK.y,ZS-.01); gS.add(carr);
+    add(rbox(.07,.08,.08,.01,2),mNero,carr).castShadow=true;
+    add(new THREE.ConeGeometry(.011,.024,12).rotateX(PI),STD(0xd9b25a,{metalness:.9,roughness:.3}),carr,0,-.052,0);
+    led=add(new THREE.SphereGeometry(.006,8,6),new THREE.MeshBasicMaterial({color:0x6fe08a,toneMapped:false}),carr,0,.02,.041);
+    punta=add(new THREE.SphereGeometry(.0045,8,6),new THREE.MeshBasicMaterial({color:0xe0a030,toneMapped:false}),carr,0,-.066,0);
+    bob=new THREE.Group(); bob.position.set(XS,YS+.72,ZS-.06); gS.add(bob);
+    add(ORIG.bobina.geometry,ORIG.bobina.material,bob).castShadow=true;
+    const mozzo=[pezzo(new THREE.CylinderGeometry(.022,.022,.07,16),0,0,0,PI/2)];
+    for(let i=0;i<3;i++) mozzo.push(pezzo(rbox(.075,.012,.05,.004,2),Math.cos(i*2.094)*.04,Math.sin(i*2.094)*.04,0,0,0,i*2.094));
+    add(unisci(mozzo),STD(0xf2efe8,{roughness:.5}),bob);
+    filo=add(new THREE.CylinderGeometry(1,1,1,6,1,true).translate(0,.5,0),mFilo,gS); filo.frustumCulled=false;
+    piatto=new THREE.Mesh(ORIG.piatto.geometry,ORIG.piatto.material); piatto.position.copy(ORIG.piatto.position);
+    piatto.castShadow=ORIG.piatto.castShadow; piatto.receiveShadow=ORIG.piatto.receiveShadow; gS.add(piatto);
+    holder=new THREE.Group(); holder.position.set(0,.006,0); holder.scale.setScalar(SCALA); piatto.add(holder);
+    // lampo del risveglio: sprite additivo dorato (niente luce nuova)
+    lampo=new THREE.Sprite(new THREE.SpriteMaterial({map:TEX_ALONE,blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,toneMapped:false,opacity:0}));
+    lampo.visible=false; gS.add(lampo);
+    // provini per il riscaldamento degli shader (con e senza ombra ricevuta)
+    for(const rs of [true,false]){ const m=add(new THREE.BoxGeometry(.02,.02,.02),matStampa,holder,0,.01,0); m.castShadow=true; m.receiveShadow=rs; m.visible=false; prove.push(m); }
+    linearizza(gS);
+  }
+  function tendiFilo(a,b,r){ _d.subVectors(b,a); const L=_d.length(); filo.position.copy(a);
+    if(L>1e-4) filo.quaternion.setFromUnitVectors(_Y,_d.multiplyScalar(1/L)); filo.scale.set(r,Math.max(L,.001),r); }
+  function viva(si){ ORIG.telaio.visible=ORIG.bobina.visible=ORIG.piatto.visible=!si; if(si){ if(!gS.parent) scene.add(gS); } else if(gS.parent) scene.remove(gS); }
+
+  // una statuina per Casa, creata una volta (prima della buca 7 del percorso) e riusata
+  const STAT={};
+  function statuina(casa){
+    if(STAT[casa]) return STAT[casa];
+    const M=mkMascotte(casa);
+    const luci=[]; M.root.traverse(o=>{ if(o.isLight) luci.push(o); });
+    for(const l of luci) l.parent.remove(l);
+    if(M.sec && M.sec.luce) M.sec.luce={intensity:0};
+    M.root.updateMatrixWorld(true);
+    const bb=new THREE.Box3().setFromObject(M.root);
+    const mats=new Map(); M.root.traverse(o=>{ if(o.isMesh && o!==M.ombra) mats.set(o,o.material); });
+    M.st.meta={x:0,z:0,yaw:YAW_S}; M.st.baseY=0; M.st.guarda=new THREE.Vector3();
+    return STAT[casa]={M, mats, h:bb.max.y*SCALA};
+  }
+  function materiale(st,stampa){ for(const [o,m] of st.mats) o.material=stampa?matStampa:m; }
+  function posaRiposo(M){ const s=M.st; s.festa=-1; s.triste=-1; s.kb=-1; s.swing=0; s.corsa=false;
+    M.root.position.set(0,0,0); M.root.rotation.set(0,YAW_S,0); s.meta.x=0; s.meta.z=0; s.meta.yaw=YAW_S;
+    s.guarda.copy(CAM_S.vicino); aggiornaMascotte(M,.5); }
+
+  // riscaldamento: un fotogramma con tutto visibile e tagliato via, poi si disfa
+  const W={stato:okStampa?1:0, clip:false, st:null, tra:-1};
+  function frameRiscalda(){
+    if(W.stato===1){
+      W.clip=renderer.localClippingEnabled; renderer.localClippingEnabled=true; PIANO.constant=-50;
+      W.st=G.casa?STAT[G.casa]||null:null;
+      if(W.st){ holder.add(W.st.M.root); materiale(W.st,true); W.st.M.ombra.visible=false; }
+      for(const m of prove) m.visible=true;
+      lampo.visible=true; lampo.material.opacity=0;
+      gS.traverse(o=>{ if(o.isMesh||o.isSprite){ o.userData.fc=o.frustumCulled; o.frustumCulled=false; } });
+      viva(true); W.stato=2;
+    } else if(W.stato===2) disfaRiscalda();
+  }
+  function disfaRiscalda(){
+    if(W.stato!==2) return;
+    gS.traverse(o=>{ if(o.userData.fc!==undefined){ o.frustumCulled=o.userData.fc; delete o.userData.fc; } });
+    viva(false); lampo.visible=false; for(const m of prove) m.visible=false;
+    if(W.st){ materiale(W.st,false); W.st.M.ombra.visible=true; holder.remove(W.st.M.root); W.st=null; }
+    renderer.localClippingEnabled=W.clip; W.stato=0;
+  }
+
+  const S={attiva:false, esposta:false, t:0, prev:0, muto:false, st:null, colori:false, clip:false, festa:false,
+    camDa:new THREE.Vector3(), lookDa:new THREE.Vector3(), P1:new THREE.Vector3()};
+  function avviaStatuina(){
+    if(!okStampa || G.fase!=='fine' || !G.casa || !PALETTE[G.casa]) return false;
+    finisciCanestro();
+    disfaRiscalda(); W.tra=-1;
+    const st=statuina(G.casa);
+    $('risultato').classList.add('nascosto'); mostraGioco(false);
+    if(document.pointerLockElement) document.exitPointerLock();
+    G.vistaAlto=false;
+    Object.assign(S,{attiva:true, esposta:false, t:0, prev:0, muto:false, st, colori:false, festa:false});
+    S.camDa.copy(camera.position); S.lookDa.copy(lookCorrente); S.camDa.y=Math.min(S.camDa.y,AULA.h-.4);
+    S.P1.set(S.camDa.x, S.camDa.y+.45, S.camDa.z+.35);              // si alza; poi passa davanti alla bussola (CAM_S.P2) e scende al bancone
+    matStampa.color.setHex(PALETTE[G.casa].tunica).convertSRGBToLinear(); mFilo.color.copy(matStampa.color);
+    S.clip=renderer.localClippingEnabled;
+    holder.add(st.M.root); posaRiposo(st.M);
+    if(RIDOTTO){ S.colori=true; st.M.ombra.visible=true; }
+    else { renderer.localClippingEnabled=true; materiale(st,true); st.M.ombra.visible=false; }
+    piatto.position.z=ZS; viva(true);
+    statoStatuina(0);
+    return true;
+  }
+  function sveglia(){
+    if(S.colori) return; S.colori=true;
+    materiale(S.st,false); S.st.M.ombra.visible=true; renderer.localClippingEnabled=S.clip;
+  }
+  function statoStatuina(dt){
+    const t=S.t, st=S.st, M=st.M, H=st.h, passa=a=>S.prev<a && t>=a && !S.muto;
+    // camera: volo curvo (Bezier cubica) dal palco al bancone, poi si avvicina piano
+    if(RIDOTTO) camera.position.copy(CAM_S.vicino);
+    else if(t>=TS.vola) camera.position.lerpVectors(CAM_S.pos,CAM_S.vicino,ease(clamp01((t-TS.vola)/(TS.sveglia-TS.vola))));
+    else { const w=ease(t/TS.vola), a=1-w, c0=a*a*a, c1=3*a*a*w, c2=3*a*w*w, c3=w*w*w;      // Bezier cubica
+      camera.position.set(c0*S.camDa.x+c1*S.P1.x+c2*CAM_S.P2.x+c3*CAM_S.pos.x, c0*S.camDa.y+c1*S.P1.y+c2*CAM_S.P2.y+c3*CAM_S.pos.y,
+                          c0*S.camDa.z+c1*S.P1.z+c2*CAM_S.P2.z+c3*CAM_S.pos.z); }
+    if(RIDOTTO || t>=TS.vola) lookCorrente.copy(CAM_S.look); else lookCorrente.lerpVectors(S.lookDa,CAM_S.look,ease(clamp01(t/(TS.vola*.85))));
+    camera.lookAt(lookCorrente);
+    // stampante: carrello, asse X, piatto e bobina in funzione di t
+    let cx=PARK.x, cy=PARK.y, pz=0, h=H+.01, rot=0, stampa=false;
+    if(!RIDOTTO){
+      rot=2.4*clamp01((t-TS.parte)/(TS.park-TS.parte))*(TS.park-TS.parte);
+      if(t<TS.parte) h=-1;
+      else if(t<TS.stampa0){ const k=ease((t-TS.parte)/(TS.stampa0-TS.parte)); h=-1; cx=mix(PARK.x,XS,k); cy=mix(PARK.y,YP+STRATO+.064,k); }
+      else if(t<TS.stampa1){ const n=Math.ceil(H/STRATO), k=Math.min(n,Math.floor((t-TS.stampa0)/(TS.stampa1-TS.stampa0)*n)+1);
+        h=Math.min(H,k*STRATO); stampa=true;
+        cx=XS+.042*Math.sin(t*29)+.012*Math.sin(t*11); cy=YP+h+.064; pz=.03*Math.sin(t*21+1.3); }
+      else if(t<TS.park){ const k=ease((t-TS.stampa1)/(TS.park-TS.stampa1)), pz1=.03*Math.sin(TS.stampa1*21+1.3);
+        cx=mix(XS+.042*Math.sin(TS.stampa1*29)+.012*Math.sin(TS.stampa1*11),PARK.x,k); cy=mix(YP+H+.064,PARK.y,k); pz=mix(pz1,0,k); }
+    }
+    PIANO.constant=YP+h;
+    carr.position.set(cx,cy,ZS-.01); asseX.position.y=cy; piatto.position.z=ZS+pz; bob.rotation.z=-rot;
+    led.visible=!RIDOTTO && t>=TS.parte && t<TS.park+.3; punta.visible=stampa;
+    tendiFilo(_a.set(XS,YS+.655,ZS-.04), _b.set(cx,cy+.04,ZS-.01), .0012);
+    // suoni: melodia d'avvio, passi dei motori, tin di fine stampa
+    if(passa(TS.parte)) [523,659,784,1047].forEach((f,i)=>tono(f,.11,'triangle',.06,i*.09));
+    if(stampa && !S.muto && Math.floor((t-TS.stampa0)/.3)>Math.floor((S.prev-TS.stampa0)/.3)) tono(150+90*Math.abs(Math.sin(t*7)),.06,'triangle',.025,0,120);
+    if(passa(RIDOTTO?.15:TS.tin)){ tono(2093,.3,'sine',.07); tono(3136,.35,'sine',.035,.05); }
+    // il risveglio: colori veri, lampo, palpebre, due salti con la mazza alzata
+    if(!RIDOTTO){
+      if(t>=TS.sveglia && !S.colori){ sveglia(); if(!S.muto){ M.st.festa=0; M.st.kb=0; [1319,1760,2349].forEach((f,i)=>tono(f,.18,'sine',.05,i*.05)); } }
+      if(passa(TS.sveglia+.4)) M.st.kb=0;
+      if(passa(TS.sveglia+.05)) tono(300,.09,'sine',.06,0,520);
+      if(passa(TS.sveglia+.57)) tono(330,.09,'sine',.06,0,560);
+      const tl=t-TS.sveglia;
+      lampo.visible=tl>=0 && tl<.45 && !S.muto;
+      if(lampo.visible){ const k=tl/.45; lampo.position.set(XS,YP+H*.55,ZS+pz); lampo.scale.setScalar(.06+.42*ease(Math.min(1,k*1.6))); lampo.material.opacity=.95*(1-k)*(1-k); }
+      if(S.colori){ M.st.guarda.copy(camera.position); aggiornaMascotte(M,dt*1.2); }
+    } else lampo.visible=false;
+  }
+  function frameStatuina(dt){
+    if(!S.attiva && !S.esposta) return;
+    if(G.fase!=='fine'){ chiudiStatuina(); return; }
+    if(!nascosto('risultato')) $('risultato').classList.add('nascosto');      // il timer di chiudiBuca non lo riapre sopra
+    if(S.attiva){
+      S.prev=S.t; S.t=Math.min(DUR_S,S.t+dt); statoStatuina(dt);
+      if(S.t>=DUR_S){ S.attiva=false; S.esposta=true; mostraCartellino(); }
+    } else {                                                                 // cartellino aperto: la statuina resta sul piatto e respira
+      camera.position.copy(CAM_S.vicino); lookCorrente.copy(CAM_S.look); camera.lookAt(lookCorrente);
+      S.st.M.st.guarda.copy(camera.position); aggiornaMascotte(S.st.M,dt);
+    }
+  }
+  function saltaStatuina(){
+    if(!S.attiva) return;
+    S.muto=true; S.prev=S.t; S.t=DUR_S; sveglia(); statoStatuina(0);
+    S.st.M.st.festa=-1; lampo.visible=false; posaRiposo(S.st.M);
+    S.attiva=false; S.esposta=true; mostraCartellino();
+  }
+  function chiudiStatuina(){
+    if(!S.attiva && !S.esposta) return;
+    S.attiva=S.esposta=false;
+    const st=S.st;
+    if(st){ materiale(st,false); st.M.ombra.visible=true; st.M.st.festa=-1; holder.remove(st.M.root); }
+    lampo.visible=false; viva(false); renderer.localClippingEnabled=S.clip; S.colori=true;
+  }
+
+  /* ================= agganci ================= */
+  if(okStampa) $('btnFineGiro').onclick=()=>{
+    if(S.attiva) return;
+    let ok=false;
+    if(G.modo==='percorso'){ try{ ok=avviaStatuina(); }catch(err){ console.error('statuina',err); chiudiStatuina(); ok=false; } }
+    if(!ok) mostraCartellino();
+  };
+  suEvento('chiusa',r=>{ if(r.b && r.b.n===7 && r.dentro){ guardiaFine(); ANT.t0=performance.now(); avviaCanestro(); } });
+  suEvento('inizioBuca',b=>{ if(b && b.n===7 && G.modo==='percorso' && okStampa) W.tra=1; });   // fra 1 s: statuina e shader pronti
+  suEvento('menu',()=>{ chiudiCanestro(); chiudiStatuina(); W.tra=-1; });
+  suEvento('cambioBuca',()=>{ chiudiCanestro(); chiudiStatuina(); W.tra=-1; });
+  suEvento('frame',dt=>{
+    if(ANT.oss && performance.now()-ANT.t0>ANT.max) guardiaFine();
+    if(W.stato) frameRiscalda();
+    else if(W.tra>=0){ W.tra-=dt; if(W.tra<0 && G.fase==='mira' && G.casa && PALETTE[G.casa]){ statuina(G.casa); W.stato=1; frameRiscalda(); } }
+    frameCanestro(dt);
+    frameStatuina(dt);
+  });
+  // clic o Invio: saltano la statuina; durante il canestro mostrano subito il riepilogo.
+  // In cattura: arrivano prima del gestore del gioco (l'Invio che apre la statuina non la salta).
+  addEventListener('keydown',e=>{
+    if(S.attiva){ if(e.code==='KeyM') return; e.stopImmediatePropagation(); e.preventDefault();
+      if(e.code==='Enter' && !e.repeat && S.t>.08) saltaStatuina(); return; }
+    if(F.on && e.code==='Enter' && !e.repeat && G.fase==='fine' && nascosto('risultato')){ e.stopImmediatePropagation(); e.preventDefault(); finisciCanestro(); mostraRiepilogo(); }
+  },true);
+  addEventListener('click',()=>{
+    if(S.attiva){ if(S.t>.08) saltaStatuina(); return; }
+    if(F.on && G.fase==='fine' && nascosto('risultato')){ finisciCanestro(); mostraRiepilogo(); }
+  },true);
+})();
+
+/* --------------------------------------------------------------------
+   RIAVVOLGIMENTO — il laboratorio si rimette a posto (+ il silenzio del green alla 7)
+   Quando si torna al menu dopo aver giocato (Menu del risultato o del cartellino, oppure
+   25 s senza input sul cartellino) il rotolo iniziale si gioca al contrario, in circa 5 s:
+     0,0-0,9  la mascotte saluta guardando la camera (festa), il caddy esulta; pallina,
+              emblema, bandierina, coppa (il foro si richiude), tee e bordi rientrano nel
+              pavimento con l'elastico rovesciato; gli oggetti scenici della buca spariscono
+     0,5-     mascotte e caddy corrono dritti alla corsia del lato porte, la percorrono ed
+              entrano nella porta d'angolo, che si apre e si richiude dietro di loro
+     1,0-4,0  il rotolo d'erba parte dal maxischermo e si riavvolge verso la vetrata
+              ingrossandosi; al suo passaggio tavoloni e sedie saltano e atterrano nella posa
+              vera del laboratorio (userData.lab); ultima la girevole, con una piroetta
+     fine     la camera, che ha seguito il rullo, si gira verso l'aula e arriva nella vista
+              d'apertura del menu; maxischermo "Benvenuti!"; G.campoPronto=false (la partita
+              dopo rifà il rotolo iniziale); emetti('riavvolto')
+   "Rigioca il percorso" non passa dal menu e non lo fa. Clic o Invio lo saltano (si applica
+   lo stato finale). Con prefers-reduced-motion lo stato finale arriva subito.
+   Eventi nuovi per gli altri effetti: emetti('riavvolgimento',durata) all'inizio (chi cambia
+   sole/luci può sincronizzarsi), emetti('riavvolto') alla fine (azzerare mele, statuina…),
+   emetti('silenzio',true|false) alla 7 quando la musica si abbassa e quando torna.
+   TECNICA (riusabile): tutto è funzione pura di t, come statoTrasformazione, con una fase
+   propria 'riavvolgi' che passoFrame fa passare dal ramo generico: il blocco scrive camera,
+   arredi e attori nell'aggancio 'frame', dopo passoFrame e prima del render.
+   - Rullo: srotola(s) con s = 1-ease(u). Ogni arredo salta quando il rullo arriva a
+     min(da.x,a.x)-0,45 e atterra quando ha superato max(da.x,a.x)+0,3: atterra sempre sul
+     pavimento già scoperto, mai sul prato ancora steso.
+   - Attori (mascotte, caddy): polilinea a velocità costante con rampa (dist/tempo/punto in
+     forma chiusa). Posizione e meta si scrivono qui (meta = posizione: aggiornaMascotte e
+     muoviCaddy non tirano altrove), st.vel/st.fase animano le gambe alla frequenza della
+     corsa normale. Il percorso usa la corsia z -1,28, libera nella disposizione del
+     laboratorio; scostamento della mascotte e partenza del caddy si cercano a passi perché il
+     caddy resti 0,5 m dietro e i due non si avvicinino mai sotto 0,32 m. La partenza del rullo
+     si cerca a passi di 0,1 s perché resti 0,6 m dietro agli attori finché non sono nella
+     corsia; lì, se li raggiunge, fanno un saltino. G.mondo=null: la quota la decide il blocco.
+   - Camera: interpolazione di yaw e pitch (non del punto guardato) per girarsi di 180° senza
+     colpi di frusta; la posa finale è quella di cameraMenu con angMenu=0.
+   Silenzio del green: alla buca 7, in fase 'carica', sfumaMusica scende al 15% in 0,6 s e al
+   tiro torna a VOL_MUSICA in 1,2 s; con la musica spenta (tasto M) non succede nulla.
+   -------------------------------------------------------------------- */
+(()=>{
+  const DUR_ROT=2.8;                                   // viaggio del rullo (s)
+  // corsia libera nella disposizione del laboratorio (fra le sedie del lato porte, z -1,07, e le bussole), poi
+  // giù nella porta d'angolo. L'anta (cerniera 5,40/-2,23, larga 0,915) si apre di 0,9 rad: la punta arriva a
+  // 5,97/-1,51, a 23 cm dalla corsia e a 18 cm dalla discesa a x 6,15 (il pannello fisso comincia a 6,315)
+  const Z_CORSIA=-1.28, W1={x:6.15,z:Z_CORSIA}, W2={x:6.15,z:-2.45}, ANTA=.9;
+  const FINE_M={x:6.55,z:-2.7}, FINE_C={x:5.75,z:-2.72}; // dentro la bussola
+  const ANG_MENU=0;                                     // l'orbita del menu riparte dalla vista d'apertura
+  const D_GIRO=1.7;                                     // a fine rotolo la camera si gira verso l'aula (dal lato finestre)
+  const _p=new THREE.Vector3(), _l=new THREE.Vector3(), _a=new THREE.Vector3(), _b=new THREE.Vector3(),
+    _pm=new THREE.Vector3(), _lm=new THREE.Vector3(), _q={x:0,z:0,yaw:0};
+  let R=null, ozio=0, silenzio=false, dopo=false;
+  const elCart=$('cartellino');
+
+  const xRullo=t=>AULA.x1-LUNG*(1-ease(clamp01((t-R.tr)/DUR_ROT)));
+  function tRullo(x){ let a=R.tr, b=R.tr+DUR_ROT; if(x<=AULA.x0) return a; if(x>=AULA.x1) return b;
+    for(let i=0;i<26;i++){ const m=(a+b)/2; if(xRullo(m)<x) a=m; else b=m; } return (a+b)/2; }
+
+  // attore su polilinea: velocità v con rampa di 0,3 s, partenza t0
+  function attore(o,pts,t0,v){ const cum=[0]; for(let i=1;i<pts.length;i++) cum.push(cum[i-1]+Math.hypot(pts[i].x-pts[i-1].x,pts[i].z-pts[i-1].z));
+    return {o,pts,cum,L:cum[cum.length-1],t0,v,dPrev:0}; }
+  function dist(A,t){ const u=t-A.t0; if(u<=0) return 0; return Math.min(A.L,u<.3?A.v*u*u/.6:A.v*(u-.15)); }
+  function tempo(A,d){ return A.t0+(d<A.v*.15?Math.sqrt(.6*d/A.v):d/A.v+.15); }
+  function punto(A,d,q){ let i=1; while(i<A.pts.length-1 && A.cum[i]<d) i++;
+    const a=A.pts[i-1], b=A.pts[i], s=A.cum[i]-A.cum[i-1], k=s>1e-6?clamp01((d-A.cum[i-1])/s):1;
+    q.x=a.x+(b.x-a.x)*k; q.z=a.z+(b.z-a.z)*k; if(s>1e-6) q.yaw=Math.atan2(b.x-a.x,b.z-a.z); return q; }
+  // finché non sono nella corsia, mascotte e caddy restano davanti al rullo (dietro c'è già la disposizione vera)
+  function rulloLibero(tr){
+    const tr0=R.tr; R.tr=tr; let ok=true;
+    for(let t=tr;t<=tr+DUR_ROT && ok;t+=.05){ const xr=xRullo(t);
+      for(const A of R.att){ if(t>=A.tCorsia) continue; punto(A,dist(A,t),_q); if(xr>_q.x-.6){ ok=false; break; } } }
+    R.tr=tr0; return ok;
+  }
+  // nella corsia il caddy resta almeno 0,5 m dietro alla mascotte
+  function caddyDietro(C,M){
+    for(let t=C.t0;t<=C.tFine;t+=.05){ const dc=dist(C,t), dm=dist(M,t);
+      if(dc<C.cum[1] || dm<M.cum[1] || dm>M.cum[2]) continue;
+      punto(C,dc,_q); const xc=_q.x; punto(M,dm,_q); if(xc>_q.x-.5) return false; }
+    return true;
+  }
+  // mascotte e caddy mai più vicini di d0 (0,32 m, o la distanza di partenza se sono già più vicini)
+  function separati(C,M,d0){
+    for(let t=0;t<=Math.max(C.tFine,M.tFine);t+=.05){ punto(C,dist(C,t),_q); const xc=_q.x, zc=_q.z;
+      punto(M,dist(M,t),_q); if(Math.hypot(xc-_q.x,zc-_q.z)<d0) return false; }
+    return true;
+  }
+  // camera che segue il rullo da dietro, alta sul lato porte: davanti ha il rullo, la corsia e la porta d'angolo
+  function posaRullo(t,pos,look){ const xr=xRullo(t);
+    pos.set(Math.min(3.2,Math.max(AULA.x0+.6,xr-2.6)),2.2,-1.0);
+    look.set(Math.min(AULA.x1-.3,Math.max(AULA.x0+4.4,xr+1.8)),.15,-.6); }
+
+  function avvia(){
+    const b=BUCHE[G.bucaIdx];
+    $('menu').classList.add('nascosto');
+    G.fase='riavvolgi'; G.vistaAlto=false; G.mondo=null; G.fluEmb=0;
+    if(document.pointerLockElement) document.exitPointerLock();
+    R={t:0, tr:1, att:[], camDa:camera.position.clone(), lookDa:lookCorrente.clone(),
+       P:b && b._props, palla:pallina.visible, emb:gEmblema.visible, suoni:{}};
+    // arredi: pose di partenza e d'arrivo, ombre di contatto che restano a terra
+    R.ogg=ARREDO.tutti.map(o=>({o, A:{x:o.position.x,z:o.position.z,ry:o.rotation.y,y:o.position.y}, B:o.userData.lab, inc:(Math.random()-.5)*.12,
+      ombre:o.children.filter(c=>c.material && (c.material.map===TEX_OMBRA||c.material.map===TEX_OMBRA_R) && c.position.y<.02)}));
+    // attori: la mascotte saluta guardando la camera, poi corre; il caddy la segue
+    const M=G.M, C=G.C;
+    // percorso: dritti alla corsia, lungo la corsia, giù nella porta. Si cerca (scostamento della mascotte,
+    // partenza del caddy) perché il caddy resti dietro e i due non si attraversino mai
+    if(M && M.root.visible){
+      const r=M.root.position, S={x:r.x,z:r.z};
+      R.metaM={x:r.x, z:r.z, yaw:Math.atan2(camera.position.x-r.x,camera.position.z-r.z)};
+      M.st.meta=R.metaM; M.st.corsa=false; M.st.festa=0; M.st.triste=-1; R.b0=M.st.baseY||0;
+      const mkM=off=>{ const A=attore(M.root,[S,{x:S.x+off,z:Z_CORSIA},W1,W2,FINE_M],.7,1);
+        A.v=Math.max(3.4,Math.min(6,A.L/2.6)); A.tFine=tempo(A,A.L); A.M=M; return A; };
+      let Am=mkM(0), Ac=null;
+      if(C && C.root.visible){
+        const rc=C.root.position, Sc={x:rc.x,z:rc.z}, d0=Math.min(.32,Math.hypot(S.x-Sc.x,S.z-Sc.z)-.01);
+        const mkC=(t0,v)=>{ const A=attore(C.root,[Sc,{x:Sc.x,z:Z_CORSIA},W1,W2,FINE_C],t0,v); A.tFine=tempo(A,A.L); A.C=C; return A; };
+        cerca: for(const off of [0,.45,-.45,.9,-.9]){ const m=mkM(off);
+          for(let t0=.5;t0<=4;t0+=.05){ const c=mkC(t0,m.v); if(caddyDietro(c,m) && separati(c,m,d0)){ Am=m; Ac=c; break cerca; } } }
+        if(!Ac) Ac=mkC(1.2,Am.v);
+        R.metaC={x:rc.x, z:rc.z, yaw:C.root.rotation.y}; C.meta=R.metaC; C.festa=0; R.c0=rc.y;
+      }
+      R.am=Am; R.att.push(Am); if(Ac) R.att.push(Ac);
+    }
+    for(const A of R.att){ A.tCorsia=tempo(A,A.cum[1]); A.tFine=tempo(A,A.L); A.k=.033*A.v; }
+    // porta: si apre quando la mascotte arriva in fondo alla corsia, si chiude dietro all'ultimo
+    R.tApre=R.am?tempo(R.am,R.am.cum[2])-.45:-1;
+    R.tChiude=R.att.length?Math.max(...R.att.map(A=>A.tFine))+.05:-1;
+    // rullo: la prima partenza che resta dietro agli attori
+    let tr=1; while(tr<4 && !rulloLibero(tr)) tr+=.1; R.tr=tr;
+    // salti degli arredi; la girevole per ultima, con la piroetta
+    let tMax=0, tFineArr=0;
+    for(const q of R.ogg){ if(q.o===ARREDO.girevole) continue;
+      const lo=Math.min(q.A.x,q.B.x)-.45, hi=Math.max(q.A.x,q.B.x)+.3;
+      q.t0=tRullo(lo)-.15; q.D=Math.max(.85,tRullo(hi)-q.t0); q.h=Math.min(.3,.15+.06*(q.D-.85)); q.giro=0;
+      tMax=Math.max(tMax,q.t0); tFineArr=Math.max(tFineArr,q.t0+q.D); }
+    for(const q of R.ogg) if(q.o===ARREDO.girevole){ const d=Math.hypot(q.B.x-q.A.x,q.B.z-q.A.z);
+      q.t0=Math.max(tMax+.25,tRullo(Math.max(q.A.x,q.B.x)+.3)); q.D=1.05; q.h=.2+.2*Math.min(1,d/3); q.giro=2*Math.PI;
+      tFineArr=Math.max(tFineArr,q.t0+q.D); }
+    // camera finale = orbita del menu da ANG_MENU; il giro parte a fine rotolo (o quando la porta si chiude)
+    _pm.set(CX+Math.cos(ANG_MENU)*4.4,1.9+.25*Math.sin(ANG_MENU*1.7),CZ+Math.sin(ANG_MENU)*1.6);
+    _lm.set(CX-Math.cos(ANG_MENU)*2.2,.7,CZ-Math.sin(ANG_MENU)*.9);
+    R.tGiro=Math.max(R.tr+DUR_ROT-.6,R.tChiude-.3,1.7);
+    posaRullo(R.tGiro,_a,_b); _b.sub(_a); _l.copy(_lm).sub(_pm);
+    R.y1=Math.atan2(_b.z,_b.x); R.p1=Math.atan2(_b.y,Math.hypot(_b.x,_b.z)); R.d1=_b.length();
+    R.y2=Math.atan2(_l.z,_l.x); R.p2=Math.atan2(_l.y,Math.hypot(_l.x,_l.z)); R.d2=_l.length();
+    while(R.y2<R.y1) R.y2+=2*Math.PI;                    // si gira dal lato delle finestre (verso +z)
+    R.fine=Math.max(4.4,tFineArr+.4,R.tChiude+.55,R.tGiro+D_GIRO);
+    emetti('riavvolgimento',R.fine);
+    if(RIDOTTO){ concludi(); return; }                  // movimento ridotto: subito il laboratorio vero
+    splash('Il laboratorio torna a posto…',null,'#fff');
+  }
+
+  const giu=u=>Math.max(.001,elastico(1-clamp01(u)));      // elastico rovesciato: da 1 a 0
+  function stato(t,dt){
+    // 1. il campo rientra nel pavimento
+    pallina.scale.setScalar(giu(t/.45)); pallina.visible=R.palla && t<.45;
+    gEmblema.scale.setScalar(giu((t-.05)/.5)); gEmblema.visible=R.emb && t<.55;
+    gFlag.scale.set(1,giu((t-.1)/.6),1);
+    gBuca.scale.setScalar(giu((t-.3)/.6));
+    gTee.scale.setScalar(giu((t-.15)/.55));
+    bordi.position.y=-.075*(1-elastico(1-clamp01((t-.2)/.7)));
+    campo.visible=t<.92;
+    if(R.P && t<1) R.P.mostra(1-clamp01((t-.05)/.8));
+    // 2. il rotolo d'erba torna verso la vetrata ingrossandosi, poi si ritira
+    srotola((AULA.x1-xRullo(t))/LUNG);
+    if(t>R.tr+DUR_ROT){ const k=1-ease(clamp01((t-R.tr-DUR_ROT)/.4)), r=rulloErba.scale.x*k;
+      rulloErba.scale.set(Math.max(.001,r),1,Math.max(.001,r)); rulloErba.position.y=r+.002; rulloErba.visible=k>.01; }
+    if(!R.suoni.rullo && t>=R.tr){ R.suoni.rullo=true; suonoWhoosh(); }
+    if(!R.suoni.tv && xRullo(t)>AULA.x0+.6){ R.suoni.tv=true; disegnaTV('Benvenuti!','Il laboratorio sta per diventare un campo da minigolf',''); }
+    // 3. arredi: saltello al passaggio del rullo, atterraggio nella posa del laboratorio
+    for(const q of R.ogg){
+      const {o,A,B}=q, u=clamp01((t-q.t0)/q.D), e=ease(u), s=Math.sin(Math.PI*u), dopoD=t-q.t0-q.D;
+      const rimb=dopoD>0?Math.sin(clamp01(dopoD/.32)*Math.PI*2)*.012*(1-clamp01(dopoD/.32)):0;
+      o.position.set(A.x+(B.x-A.x)*e, A.y*(1-e)+q.h*s+rimb, A.z+(B.z-A.z)*e);
+      o.rotation.set(q.inc*s, A.ry+angDiff(A.ry,B.ry)*e+q.giro*ease(u), .09*s);
+      for(const c of q.ombre) c.position.y=.009-o.position.y;
+    }
+    // 4. mascotte e caddy: saluto, corsa alla porta, dentro la bussola
+    for(const A of R.att){
+      const d=dist(A,t), passo=d-A.dPrev; A.dPrev=d; punto(A,d,_q);
+      const meta=A.M?R.metaM:R.metaC;
+      if(d>0){ meta.x=_q.x; meta.z=_q.z; meta.yaw=_q.yaw; A.o.position.x=_q.x; A.o.position.z=_q.z; }
+      const kd=clamp01((t-A.t0)/.35), dr=(xRullo(t)-A.o.position.x)/.45;
+      const salto=t>R.tr && Math.abs(dr)<1 ? .3*(1-dr*dr) : 0;          // il rullo li raggiunge nel corridoio della porta: saltino
+      if(A.M){ const st=A.M.st;
+        if(d>0 && st.festa>=0) st.festa=-1;
+        if(passo>0){ st.fase+=passo/A.k; st.vel=Math.max(st.vel,A.v*.8); }
+        st.baseY=R.b0*(1-ease(kd))+(R.b0>.05?.12*Math.sin(Math.PI*kd):0)+salto;
+        if(salto>0) A.M.ombra.position.y=.009-A.o.position.y;                // l'ombra resta a terra
+        if(!pallina.visible){ if(d>0) pallina.position.set(_q.x+Math.sin(meta.yaw)*2,.3,_q.z+Math.cos(meta.yaw)*2);   // lo sguardo: avanti
+          else pallina.position.copy(camera.position); }                                                   // mentre saluta: verso chi guarda
+      } else { if(d>0 && A.C.festa>=0) A.C.festa=-1;
+        if(passo>0 && dt>0) A.C.vel=Math.max(A.C.vel,Math.min(2.4,passo/dt));
+        A.o.position.y=R.c0*(1-ease(kd))+salto; }
+      A.o.visible=t<R.tChiude+.5;
+    }
+    if(R.tApre>=0){
+      const ap=clamp01((t-R.tApre)/.4)-clamp01((t-R.tChiude)/.5);
+      PORTE[1].rotation.y=-ANTA*ease(ap);
+      if(!R.suoni.porta && t>=R.tApre){ R.suoni.porta=true; suonoPorta(); }
+    }
+    // 5. camera: si alza e va dietro al rullo (alta sul lato porte), lo segue verso la vetrata; a fine rotolo
+    //    si gira verso l'aula dal lato finestre e arriva sull'orbita del menu (yaw/pitch interpolati)
+    posaRullo(Math.min(t,R.tGiro),_a,_b);
+    const w1=ease(clamp01((t-.5)/1.1)), wy=ease(clamp01((t-.5)/.6));
+    _p.set(R.camDa.x+(_a.x-R.camDa.x)*w1, R.camDa.y+(_a.y-R.camDa.y)*wy, R.camDa.z+(_a.z-R.camDa.z)*w1);
+    _l.copy(R.lookDa).lerp(_b,w1);
+    if(t>R.tGiro){ const w=ease(clamp01((t-R.tGiro)/D_GIRO)), yw=R.y1+(R.y2-R.y1)*w, pt=R.p1+(R.p2-R.p1)*w, dd=R.d1+(R.d2-R.d1)*w;
+      _p.lerp(_pm,w); _l.set(_p.x+Math.cos(yw)*Math.cos(pt)*dd, _p.y+Math.sin(pt)*dd, _p.z+Math.sin(yw)*Math.cos(pt)*dd); }
+    camera.position.copy(_p); lookCorrente.copy(_l); camera.lookAt(lookCorrente);
+  }
+
+  function concludi(){
+    if(!R) return;
+    applicaDisposizione(disposizioneLab());
+    for(const q of R.ogg) for(const c of q.ombre) c.position.y=.009;
+    srotola(0); rulloErba.visible=false; campo.visible=false;
+    bordi.position.y=0; gBuca.scale.set(1,1,1); gFlag.scale.set(1,1,1); gTee.scale.setScalar(1);
+    pallina.visible=false; pallina.scale.setScalar(1); ombraPallina.visible=false; guida.visible=false;
+    gEmblema.visible=false; gEmblema.scale.setScalar(1); G.fluEmb=0;
+    for(const b of BUCHE) if(b && b._props) b._props.mostra(0);
+    PORTE[1].rotation.y=0;
+    if(G.M){ const st=G.M.st; G.M.root.visible=false; st.festa=-1; st.triste=-1; st.baseY=0; st.corsa=false; st.vel=0;
+      G.M.root.position.set(FINE_M.x,0,FINE_M.z); st.meta={x:FINE_M.x,z:FINE_M.z,yaw:Math.PI}; }
+    if(G.C){ G.C.root.visible=false; G.C.festa=-1; G.C.vel=0; G.C.root.position.set(FINE_C.x,0,FINE_C.z); G.C.meta={x:FINE_C.x,z:FINE_C.z,yaw:Math.PI};
+      const cp=G.C.sacca && G.C.sacca.userData.copri; if(cp) for(const c of cp) if(c) c.visible=true; }   // la mazza torna nella sacca
+    disegnaTV('Benvenuti!','Il laboratorio sta per diventare un campo da minigolf','');
+    G.mondo=null; G.consegna=null; G.campoPronto=false;
+    R=null; dopo=true; ozio=0;
+    angMenu=ANG_MENU; G.fase='menu'; cameraMenu(0);
+    $('menu').classList.remove('nascosto'); aggiornaMenu();
+    emetti('riavvolto');
+  }
+
+  // di nuovo 'menu' a metà riavvolgimento (tornaAlMenu chiamato da altri): si chiude subito, mai a metà
+  suEvento('menu',()=>{ if(R) concludi(); else if(G.campoPronto) avvia(); });
+  // partita dopo il riavvolgimento senza l'ingresso dalla porta (prefers-reduced-motion, o rotolo saltato
+  // prima della porta): mascotte e caddy ancora nella bussola vanno subito al loro posto
+  suEvento('inizioBuca',()=>{ if(!dopo) return; dopo=false;
+    if(G.M && G.M.root.position.z<-2.25){ piazzaMascotte(G.M,G.M.st.meta); G.M.st.baseY=0; }
+    if(G.C && G.C.meta && G.C.root.position.z<-2.25) G.C.root.position.set(G.C.meta.x,0,G.C.meta.z); });
+  suEvento('cartellino',()=>{ ozio=0; });
+  suEvento('frame',dt=>{
+    // silenzio del green: alla 7 la musica si abbassa mentre si carica il tiro
+    const vuole=G.fase==='carica' && G.bucaIdx===6;
+    if(vuole!==silenzio){ silenzio=vuole; if(musicaOn) sfumaMusica(vuole?VOL_MUSICA*.15:VOL_MUSICA,vuole?600:1200); emetti('silenzio',vuole); }
+    // cartellino lasciato aperto: dopo 25 s senza input si torna al menu (e parte il riavvolgimento)
+    if(!R && !elCart.classList.contains('nascosto')){ ozio+=dt; if(ozio>=25){ ozio=0; tornaAlMenu(); } }
+    else ozio=0;
+    if(!R) return;
+    if(G.fase!=='riavvolgi'){ R=null; return; }          // qualcun altro ha cambiato fase: si lascia fare
+    G.vistaAlto=false; R.t+=dt; stato(R.t,dt);
+    if(R.t>=R.fine) concludi();
+  });
+  for(const n of ['pointerdown','pointermove','keydown','wheel','touchstart']) addEventListener(n,()=>{ ozio=0; },{capture:true,passive:true});
+  canvas.addEventListener('click',()=>{ if(R) concludi(); });
+  addEventListener('keydown',e=>{ if(R && e.code==='Enter'){ e.preventDefault(); concludi(); } });
 })();
 
 /* ==== EXTRA:FINE ==== */
