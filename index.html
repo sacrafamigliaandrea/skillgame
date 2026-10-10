@@ -25,7 +25,6 @@
   #hud .v{font-size:24px;font-weight:800;color:var(--oro);line-height:1.1}
   #hud .sp{font-size:9.5px;opacity:.6;margin-top:1px;text-transform:none;letter-spacing:0}
   #risultato .spiega{font-size:15px;opacity:.85;margin-top:6px}
-  .box p.par{font-size:12.5px;opacity:.72;margin-top:10px}
   #hud .l{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;opacity:.72}
   #barraPot{position:fixed;left:50%;bottom:96px;transform:translateX(-50%);z-index:5;
     width:280px;height:16px;border-radius:9px;overflow:hidden;
@@ -142,10 +141,7 @@
   <div class="box pann">
     <h1>Minigolf <span>delle Skill</span></h1>
     <div class="firma">powered by <b>acerio</b> · Animatore digitale Andrea Cerioli</div>
-    <p>Il laboratorio di informatica diventa un campo da minigolf.<br>
-       In ogni buca è nascosta una skill: trovala e porta punti alla tua Casa.</p>
-    <p class="par">Ogni buca ha un <b>par</b>: il numero di colpi previsti per mandare la pallina in buca.
-       Meno colpi fai, più punti porti alla tua Casa.</p>
+    <p>È il momento di fare punti per la tua Casa:<br>esplora le buche e recupera le skill nascoste!</p>
     <div class="etichetta">Il tuo soprannome</div>
     <input id="nome" maxlength="16" autocomplete="off" spellcheck="false">
     <div class="etichetta">La tua Casa</div>
@@ -10405,6 +10401,8 @@ aggiornaBtnMusica();
    ritenta ogni 15 s. Ogni risultato ha un id casuale (il server ignora i doppioni) e porta
    l'etichetta della sfida in cui è stato giocato.
    I punti mostrati = totali del server + risultati ancora in coda (tratteggio).
+   Ogni notte alle 00:00 barre e classifica ripartono da zero: il server conta solo i risultati
+   di oggi e ogni risultato porta il giorno in cui è stato giocato.
    ===================================================================== */
 const URL_CLASSIFICA='https://script.google.com/macros/s/AKfycbz4fA1o_PQ24lsdSsnzuBfe366_-2w-B71r_MKGXJ_ar15vumEqbvX614sPV5MllYP7rg/exec';   // deployment di classifica.gs (Foglio "Minigolf delle Skill")
 const K_CODA='mg_coda', K_LOCALE='mg_locale';
@@ -10417,7 +10415,7 @@ function pulisciNome(v){ return String(v||'').replace(/[<>&"=+\-@\t\r\n]/g,'').r
 function idRisultato(){ const a=new Uint32Array(3); crypto.getRandomValues(a); return Array.from(a,x=>x.toString(36)).join('').slice(0,24).padEnd(8,'0'); }
 let TOT=null, rangoPrima=-1, tNotaVivo=0, SFIDA_SERVER='';
 function registraRisultato(r){
-  r.id=idRisultato(); r.sfida=(TOT&&TOT.sfida)||SFIDA_SERVER||''; r.nome=G.nome;
+  r.id=idRisultato(); r.sfida=(TOT&&TOT.sfida)||SFIDA_SERVER||''; r.nome=G.nome; r.giorno=oggiISO();
   if(URL_CLASSIFICA){ const c=lsLeggi(K_CODA,[]); c.push(r); lsScrivi(K_CODA,c.slice(-300)); svuotaCoda(); }
   else { const l=lsLeggi(K_LOCALE,{}), d=oggiISO(); (l[d]=l[d]||[]).push(r); for(const k of Object.keys(l)) if(k!==d) delete l[k]; lsScrivi(K_LOCALE,l); }
   aggiornaPannello();
@@ -10429,7 +10427,7 @@ async function svuotaCoda(){
   try{
     for(let c=lsLeggi(K_CODA,[]); c.length; c=lsLeggi(K_CODA,[])){
       const r=c[0];
-      const qs=new URLSearchParams({action:'segna',casa:r.casa,buca:r.buca,colpi:r.colpi,dentro:r.dentro?1:0,emblema:r.emblema?1:0,id:r.id,sfida:r.sfida||'',nome:r.nome||''});
+      const qs=new URLSearchParams({action:'segna',casa:r.casa,buca:r.buca,colpi:r.colpi,dentro:r.dentro?1:0,emblema:r.emblema?1:0,id:r.id,sfida:r.sfida||'',nome:r.nome||'',giorno:r.giorno||''});
       const ctl=new AbortController(), tm=setTimeout(()=>ctl.abort(),30000);   // una richiesta appesa non blocca coda e barre
       let j=null;
       try{ j=await (await fetch(URL_CLASSIFICA+'?'+qs,{cache:'no-store',signal:ctl.signal})).json(); }
@@ -10454,7 +10452,8 @@ function totaliCorrenti(){
   if(URL_CLASSIFICA){
     if(TOT && TOT.case) for(const k in TOT.case) if(t[k]){ t[k].punti=Number(TOT.case[k].punti)||0; (TOT.case[k].emblemi||[]).forEach(b=>t[k].emblemi.add(b)); }
     if(TOT && TOT.giocatori) for(const x of TOT.giocatori) aggG(String(x.n),String(x.c),Number(x.p)||0);
-    for(const r of lsLeggi(K_CODA,[])) if(t[r.casa]){ t[r.casa].attesa+=r.punti||0; if(r.emblema) t[r.casa].emblemi.add(r.buca); aggG(r.nome,r.casa,r.punti||0); }
+    // in coda contano solo i risultati di oggi: a mezzanotte la sfida riparte da zero (come sul server)
+    for(const r of lsLeggi(K_CODA,[])) if(t[r.casa] && (r.giorno||oggiISO())===oggiISO()){ t[r.casa].attesa+=r.punti||0; if(r.emblema) t[r.casa].emblemi.add(r.buca); aggG(r.nome,r.casa,r.punti||0); }
   } else {
     for(const r of (lsLeggi(K_LOCALE,{})[oggiISO()]||[])) if(t[r.casa]){ t[r.casa].punti+=r.punti||0; if(r.emblema) t[r.casa].emblemi.add(r.buca); aggG(r.nome,r.casa,r.punti||0); }
   }
@@ -10632,8 +10631,9 @@ function statoTrasformazione(t){
   // porta d'angolo: si apre, entra la mascotte, si richiude
   const ap=clamp01((t-TR.mascotte+.4)/.45)-clamp01((t-TR.mascotte-1.3)/.6);
   PORTE[1].rotation.y=-1.25*ease(ap);
-  if(t>=TR.mascotte && !T.entrata){ T.entrata=true; G.M.root.visible=true; G.M.st.corsa=true;
-    G.M.root.position.set(DOOR.x,0,DOOR.z); G.M.root.rotation.y=0; suonoPorta();
+  INTRO.rotolo(t);                                     // dopo il volo la mascotte balza giù dal tavolo del docente
+  if(t>=TR.mascotte && !T.entrata){ T.entrata=true; suonoPorta();
+    if(!INTRO.attivo()){ G.M.root.visible=true; G.M.st.corsa=true; G.M.root.position.set(DOOR.x,0,DOOR.z); G.M.root.rotation.y=0; }
     if(G.C){ G.C.root.visible=true; G.C.root.position.set(DOOR.x+.12,0,DOOR.z-.15); } }
   if(!T.whoosh && t>TR.inizio){ T.whoosh=true; suonoWhoosh(); }
   // telecamera: segue il rullo, poi guarda la porta, poi scende dietro la pallina
@@ -10644,6 +10644,7 @@ function statoTrasformazione(t){
   const w0=ease(clamp01(t/.9)), w12=ease(clamp01((t-TR.campo+.4)/1.1)), w23=ease(clamp01((t-TR.mascotte-.9)/1.5));
   const pos=T.camDa.clone().lerp(p1,w0).lerp(p2,w12).lerp(p3,w23);
   const look=T.lookDa.clone().lerp(l1,w0).lerp(l2,w12).lerp(l3,w23);
+  if(INTRO.attivo()) INTRO.cameraRotolo(T,t,pos,look);  // gru sul tavolo del docente, poi dietro la mascotte che corre
   camera.position.copy(pos); lookCorrente.copy(look); camera.lookAt(lookCorrente);
 }
 function avviaTrasformazione(fine){
@@ -10662,6 +10663,7 @@ function avviaTrasformazione(fine){
   campo.visible=false;
 }
 function concludiTrasformazione(){
+  INTRO.fineRotolo();
   const T=G.trasf; G.trasf=null;
   srotola(1); campo.visible=true; bordi.position.y=0; gBuca.scale.set(1,1,1); gTee.scale.setScalar(1); gFlag.scale.set(1,1,1);
   pallina.scale.setScalar(1); pallina.visible=true; ombraPallina.visible=true;
@@ -10684,6 +10686,194 @@ function iniziaBuca(){
   avviaConsegna();
   emetti('inizioBuca',b);
 }
+
+/* =====================================================================
+   INGRESSO — il volo nel laboratorio e le quattro Case in posa da eroi
+   Solo all'inizio della partita, prima del rotolo d'erba; clic o Invio saltano tutto.
+   0,0-3,0 s  la camera vola dentro l'aula: dal giro del menu scende verso le finestre
+              dell'angolo est, passa rasoterra fra sedie e termosifoni nei raggi di sole,
+              risale e plana davanti alla postazione del docente. La girevole del docente
+              rotola di lato con una piroetta per fare spazio.
+   1,1-2,2 s  le quattro mascotte piombano sul tavolo una dopo l'altra (atterraggio da
+              supereroe, sbuffo di polvere) e si alzano in posa da eroi: gambe larghe, petto
+              in fuori, mento alto, mani sul pomolo della mazza piantata come una spada.
+              Dietro di loro il grande iMac del docente mostra il titolo del gioco.
+   3,0-4,1 s  inquadratura dal basso, la camera si avvicina piano; poi parte il rotolo.
+   Nel rotolo il tavolo salta con le mascotte sopra; quando è atterrato la mascotte del
+   giocatore balza giù con la mazza alzata e corre al tee (il caddy esce dalla porta come
+   sempre), le altre tre restano sul tavolo e fanno il tifo per tutta la prima buca; al
+   cambio buca spariscono con un pop.
+   Tecnica: le mascotte sono figlie del tavoloOvest, così seguono i salti del rotolo senza
+   calcoli; la posa si applica DOPO aggiornaMascotte, nell'aggancio 'frame'. Le braccia di
+   tre mascotte su quattro sono un pezzo unico con le mani sull'impugnatura: la posa da eroe
+   usa la mazza piantata (perno ruotato di +0,53 rad = mazza verticale) invece delle mani sui
+   fianchi, che richiederebbe di rifare le braccia. La camera segue due CatmullRomCurve3
+   centripete (posizione e punto guardato) percorse a velocità costante con getPointAt + ease.
+   ===================================================================== */
+const INTRO=(()=>{
+  const ORDINE=['aquilablu','quercia','cerogiallo','tassorosso'];       // da sinistra a destra, visti dalla camera
+  const XL=2.66, ZL=[.405,.135,-.135,-.405];                            // posti sul piano, coordinate del tavolo
+  const CADUTA=.42, T_SALTO=.62;                                        // durata del volo e atterraggi: in avvia()
+  let squadra=null, polveri=null, texTitolo=null, S=null, S0=null;
+  const _v=V(0,0,0), _p=V(0,0,0), _l=V(0,0,0), _d=V(0,0,0);
+  const tav=()=>ARREDO.tavoli.find(o=>o.userData.id==='tavoloOvest');
+  function texTitoloIntro(){
+    const c=mkCanvas(1024,576), g=c.getContext('2d');
+    const gr=g.createLinearGradient(0,0,0,576); gr.addColorStop(0,'#1b4fae'); gr.addColorStop(1,'#0b2659');
+    g.fillStyle=gr; g.fillRect(0,0,1024,576);
+    g.save(); g.translate(512,230); g.globalAlpha=.09; g.fillStyle='#ffd28a';           // raggiera dietro il titolo
+    for(let i=0;i<18;i++){ g.rotate(Math.PI/9); g.beginPath(); g.moveTo(0,0); g.lineTo(720,-46); g.lineTo(720,46); g.fill(); }
+    g.restore(); g.textAlign='center';
+    g.fillStyle='#fff'; g.font="800 118px Lexend, Arial"; g.fillText('Minigolf',512,150);   // in alto: sotto stanno le mascotte
+    g.fillStyle='#ffd28a'; g.font="800 86px Lexend, Arial"; g.fillText('delle Skill',512,240);
+    CASE.forEach((k,i)=>{ const x=82+i*222; rRect(g,x,362,196,92,20); g.fillStyle=k.css; g.fill();
+      g.lineWidth=4; g.strokeStyle='rgba(255,255,255,.55)'; g.stroke();
+      g.fillStyle='#fff'; g.font="700 30px Lexend, Arial"; g.fillText(k.nome,x+98,419); });
+    g.globalAlpha=.7; g.fillStyle='#fff'; g.font="500 24px Lexend, Arial"; g.fillText('powered by acerio',512,528);
+    return tex(c);
+  }
+  function crea(){
+    squadra=ORDINE.map((id,k)=>{ const M=mkMascotte(id); M.casa=id; M.root.visible=false;
+      M.st.meta={x:XL,z:ZL[k],yaw:Math.PI/2}; M.st.baseY=H_TAV; return M; });
+    polveri=ORDINE.map(()=>{ const m=new THREE.Mesh(new THREE.RingGeometry(.045,.1,28).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({color:0xfff3df,transparent:true,opacity:0,depthWrite:false})); m.visible=false; return m; });
+    texTitolo=texTitoloIntro();
+  }
+  // tavolo -> mondo con una posa {x,z,ry} (three: x' = x cos + z sin, z' = -x sin + z cos)
+  const daTavolo=(f,lx,ly,lz)=>V(f.x+lx*Math.cos(f.ry)+lz*Math.sin(f.ry),ly,f.z-lx*Math.sin(f.ry)+lz*Math.cos(f.ry));
+  const dentro=p=>{ p.x=Math.max(AULA.x0+.35,Math.min(AULA.x1-.35,p.x)); p.z=Math.max(AULA.zP+.35,Math.min(AULA.zF-.35,p.z)); p.y=Math.min(AULA.h-.3,p.y); return p; };
+  function avvia(i){
+    if(!squadra) crea();
+    const T=tav(), f={x:T.position.x,z:T.position.z,ry:T.rotation.y}, gir=ARREDO.girevole;
+    squadra.forEach((M,k)=>{ T.add(M.root); M.root.position.set(XL,H_TAV+.9,ZL[k]); M.root.rotation.set(0,Math.PI/2,0);
+      M.root.scale.setScalar(1); M.root.visible=false; M.st.festa=-1; M.st.triste=-1;
+      T.add(polveri[k]); polveri[k].position.set(XL,H_TAV+.004,ZL[k]); polveri[k].visible=false; });
+    let sd=null; T.traverse(o=>{ if(o.material && o.material.emissiveMap===SCHERMO_DOC) sd=o; });   // il grande iMac del docente
+    if(!sd && S0) sd=S0.sd;
+    S={t:0, i, fase:'volo', mia:ORDINE.indexOf(G.casa), salto:null, saltato:false, pop:-1, kp:[0,0,0,0], dTesta:[0,0,0,0], atterrati:[0,0,0,0], tada:false,
+      sd, mapOrig:sd.material.emissiveMap, girDa:{x:gir.position.x,z:gir.position.z,ry:gir.rotation.y}};
+    S.girA={x:S.girDa.x+.25, z:Math.max(AULA.zP+.6,S.girDa.z-.9), ry:S.girDa.ry-Math.PI*1.5};   // verso le porte: fuori dalla traiettoria della camera
+    sd.material.emissiveMap=texTitolo; sd.material.needsUpdate=true; S0={sd};
+    // percorso del volo: angolo est vicino alle finestre, rasoterra fra sedie e termosifoni, su verso la postazione del docente
+    const P=[camera.position.clone(), V(5.0,1.2,2.3), V(1.6,.68,2.42), daTavolo(f,4.1,1.3,1.35), daTavolo(f,3.88,.97,0)];
+    const L=[lookCorrente.clone(), V(2.0,.7,1.6), V(-1.4,.75,1.4), daTavolo(f,XL-.02,.95,.4), daTavolo(f,XL-.06,1.0,0)];
+    S.cP=new THREE.CatmullRomCurve3(P.map(dentro),false,'centripetal'); S.cL=new THREE.CatmullRomCurve3(L,false,'centripetal');
+    S.P4=P[4].clone(); S.L4=L[4].clone();
+    // velocità di crociera ~5,5 m/s qualunque sia il punto del giro del menu da cui si parte;
+    // le mascotte atterrano quando la camera è ormai davanti al tavolo
+    S.T_VOLO=Math.max(2.4,Math.min(3.4,S.cP.getLength()/5.5)); S.DUR=S.T_VOLO+1.35;
+    S.T_ATT=[0,1,2,3].map(k=>S.T_VOLO-.8+k*.24);
+    G.M.root.visible=false; if(G.C) G.C.root.visible=false;
+    campo.visible=false; pallina.visible=false; ombraPallina.visible=false; gEmblema.visible=false;
+    G.fase='volo'; suonoWhoosh();
+  }
+  function posaGirevole(u){
+    const g=ARREDO.girevole, A=S.girDa, B=S.girA, e=ease(clamp01(u));
+    g.position.set(A.x+(B.x-A.x)*e,.05*Math.sin(Math.PI*clamp01(u)),A.z+(B.z-A.z)*e); g.rotation.set(0,A.ry+(B.ry-A.ry)*e,0);
+  }
+  function passo(dt){
+    S.t+=dt; const t=S.t;
+    posaGirevole((t-.75)/.9);
+    if(t<S.T_VOLO){ const u=ease(clamp01(t/S.T_VOLO)); S.cP.getPointAt(u,_p); S.cL.getPointAt(u,_l); }
+    else { const w=ease(clamp01((t-S.T_VOLO)/(S.DUR-S.T_VOLO)));                // inquadratura dal basso che si avvicina
+      _p.copy(S.P4).lerp(S.L4,.24*w); _p.y-=.03*w; _l.copy(S.L4); }
+    camera.position.copy(_p); lookCorrente.copy(_l); camera.lookAt(lookCorrente);
+    if(!S.tada && t>S.T_ATT[3]+.5){ S.tada=true; tono(523,.55,'triangle',.07); tono(659,.55,'triangle',.06,.07); tono(784,.8,'triangle',.06,.14); }
+    if(t>=S.DUR) avviaRotolo();
+  }
+  function avviaRotolo(){
+    posaGirevole(1); S.fase='rotolo';
+    avviaTrasformazione(BUCHE[S.i].disponi()); G.fase='trasforma'; splash('Il laboratorio si trasforma…',null,'#fff');
+    const T=G.trasf, f=posaDi(tav(),T.a);
+    S.tSalto=Math.max(T.thop.tavoloOvest+.85+.35, TR.campo-.4);           // il tavolo è atterrato
+    S.gruPos=dentro(daTavolo(f,XL+2.1,2.2,2.3)); S.gruLook=daTavolo(f,XL-.6,.55,-.2);   // alta e verso le finestre: sopra sedie e iMac
+  }
+  // da statoTrasformazione: la mascotte del giocatore balza giù dal tavolo
+  function rotolo(t){
+    if(!S || S.fase!=='rotolo' || S.saltato || t<S.tSalto) return;
+    S.saltato=true; const M=squadra[S.mia]; M.root.getWorldPosition(_v); M.root.visible=false;
+    const a=dentro(tav().localToWorld(V(XL+.8,0,ZL[S.mia]))); a.y=0;
+    S.salto={t0:t, da:_v.clone(), a};
+    G.M.root.visible=true; G.M.root.position.copy(_v); G.M.st.corsa=false;
+    montaMazza(G.M,mazzaPutter(PALETTE[G.casa]));
+    tono(392,.22,'triangle',.08,0,784); suonoWhoosh();
+  }
+  function cameraRotolo(T,t,pos,look){
+    const {pos:p3,look:l3}=posaCameraGioco();
+    const w0=ease(clamp01(t/1.3)), w12=ease(clamp01((t-S.tSalto+.1)/1.0)), w23=ease(clamp01((t-TR.mascotte-.9)/1.5));
+    const m=G.M.root.visible?G.M.root.position:S.gruLook, b=BUCHE[G.bucaIdx];
+    _d.set(b.tee.x-m.x,0,b.tee.z-m.z); if(_d.lengthSq()<1e-4) _d.set(1,0,0); _d.normalize();
+    // la gru resta alta (sopra sedie e iMac: nessun arredo in mezzo), scivola un po' verso la mascotte e la segue con lo sguardo
+    _p.copy(S.gruPos); _p.x+=(m.x-_p.x)*.15; dentro(_p); _l.set(m.x+_d.x*.6,.3,m.z+_d.z*.6);
+    pos.copy(T.camDa).lerp(S.gruPos,w0).lerp(_p,w12);
+    look.copy(T.lookDa).lerp(S.gruLook,w0).lerp(_l,w12).lerp(l3,w23);
+    // verso la posizione di gioco: prima in orizzontale restando in alto (sopra sedie e iMac), poi giù sopra il tee
+    const yAlto=pos.y; pos.x+=(p3.x-pos.x)*w23; pos.z+=(p3.z-pos.z)*w23; pos.y=yAlto+(p3.y-yAlto)*w23*w23*w23;
+  }
+  // da concludiTrasformazione (anche quando si salta)
+  function fineRotolo(){
+    if(!S) return;
+    if(S.fase==='volo'){ posaGirevole(1); S.atterrati=[1,1,1,1]; S.tada=true; }
+    S.t=Math.max(S.t,S.DUR);
+    if(S.salto){ S.salto=null; montaMazza(G.M,mazzaVuota()); piazzaMascotte(G.M,G.M.st.meta); }
+    S.saltato=true; S.fase='buca'; S.kp=[1,1,1,1];
+  }
+  function salta(){                                       // clic o Invio durante il volo: si va dritti alla buca
+    S.t=S.DUR; avviaRotolo(); concludiTrasformazione();
+  }
+  function ripristina(){
+    if(!S) return;
+    S.sd.material.emissiveMap=S.mapOrig; S.sd.material.needsUpdate=true;
+    squadra.forEach((M,k)=>{ M.root.visible=false; M.root.scale.setScalar(1); polveri[k].visible=false; });
+    S=null;
+  }
+  function posa(M,k,att,aria){
+    for(const g of M.gambe){ const s=Math.sign(g.position.x)||1; g.rotation.z=s*(.2*k+.1*att); }
+    M.anca.position.y=.085-.008*k-.035*att;
+    M.busto.rotation.x=M.busto.rotation.x*(1-k)*(1-att)-.12*k+.5*att;
+    M.perno.rotation.x=M.perno.rotation.x*(1-k)*(1-aria)+.53*k+.2*att-1.3*aria;
+  }
+  suEvento('frame',(dt)=>{
+    if(!S || !squadra) return;
+    // la mascotte del giocatore in volo dal tavolo al pavimento, braccia e mazza al cielo
+    if(S.salto && G.trasf){ const u=clamp01((G.trasf.t-S.salto.t0)/T_SALTO), d=S.salto.da, a=S.salto.a;
+      G.M.root.position.set(d.x+(a.x-d.x)*u,d.y*(1-u)+.42*Math.sin(Math.PI*u),d.z+(a.z-d.z)*u);
+      G.M.root.rotation.y=Math.atan2(a.x-d.x,a.z-d.z);
+      G.M.perno.rotation.x=-1.5*Math.sin(Math.PI*Math.min(1,u*1.15));
+      if(u>=1){ S.salto=null; montaMazza(G.M,mazzaVuota()); G.M.root.position.set(a.x,0,a.z); G.M.st.corsa=true;
+        tono(110,.14,'sine',.14,0,70); rumore(.1,.05,600); } }
+    // il pop di congedo al cambio buca
+    if(S.pop>=0){ S.pop+=dt; const s=Math.max(.001,1-ease(clamp01(S.pop/.35)));
+      squadra.forEach((M,k)=>{ if(k!==S.mia || !S.saltato) M.root.scale.setScalar(s); });
+      if(S.pop>=.35){ ripristina(); return; } }
+    const tv=S.fase==='volo'?S.t:99;
+    squadra.forEach((M,k)=>{
+      if(k===S.mia && S.saltato){ M.root.visible=false; return; }
+      const tk=tv-S.T_ATT[k];
+      if(tk<-CADUTA){ M.root.visible=false; return; }
+      M.root.visible=true;
+      M.st.guarda=(S.fase==='buca' && pallina.visible)?pallina.position:camera.position;
+      M.testa.rotation.x-=S.dTesta[k];                       // aggiornaMascotte insegue il suo bersaglio: si toglie il mento alto
+      aggiornaMascotte(M,dt);
+      let yoff=0, att=0, aria=0, kt=1;
+      if(tk<0){ const u=1+tk/CADUTA; yoff=.9*(1-u*u); aria=1; kt=0; }
+      else { att=Math.max(0,1-tk/.3); kt=ease(clamp01((tk-.1)/.42));
+        if(!S.atterrati[k]){ S.atterrati[k]=1; tono(95,.16,'sine',.15,0,58); rumore(.12,.05,700); } }
+      if(M.st.festa>=0) kt=0;                                 // tifo: salti e braccia al cielo, poi di nuovo in posa
+      S.kp[k]+=(kt-S.kp[k])*(tk<.6?1:Math.min(1,dt*7));
+      M.root.position.y+=yoff; M.ombra.position.y-=yoff;      // l'ombra resta sul piano mentre la mascotte cade
+      posa(M,S.kp[k],att,aria);
+      S.dTesta[k]=-.22*S.kp[k]; M.testa.rotation.x+=S.dTesta[k];
+      const pv=polveri[k]; pv.visible=tk>=0 && tk<.45;
+      if(pv.visible){ pv.scale.setScalar(1+tk*7); pv.material.opacity=.5*(1-tk/.45); }
+    });
+  });
+  // le tre Case sul tavolo esultano quando la pallina va in buca
+  suEvento('evento',e=>{ if(S && S.fase==='buca' && e.tipo==='buca') squadra.forEach((M,k)=>{ if(k!==S.mia) M.st.festa=0; }); });
+  suEvento('cambioBuca',()=>{ if(S && S.pop<0) S.pop=0; });
+  suEvento('menu',()=>ripristina());
+  return {avvia, passo, salta, rotolo, cameraRotolo, fineRotolo, attivo:()=>!!S && S.fase==='rotolo', inVolo:()=>!!S && S.fase==='volo'};
+})();
 
 /* =====================================================================
    CAMBIO BUCA — la trasformazione della buca nuova (firma) oppure un
@@ -10863,7 +11053,7 @@ function avviaBuca(i){
   for(const id of ['menu','risultato','cartellino']) $(id).classList.add('nascosto');
   if(!G.campoPronto){                                  // prima buca: il laboratorio si trasforma
     preparaBuca(i);
-    if(!RIDOTTO){ avviaTrasformazione(BUCHE[i].disponi()); G.fase='trasforma'; splash('Il laboratorio si trasforma…',null,'#fff'); }
+    if(!RIDOTTO) INTRO.avvia(i);                       // volo nel laboratorio, poi il rotolo (INTRO.avviaRotolo)
     else { G.M.root.visible=true; G.C.root.visible=true; concludiTrasformazione(); }
   } else avviaTransizione(i);                          // cambio buca: la sua trasformazione
 }
@@ -11022,10 +11212,11 @@ addEventListener('keydown',e=>{
   if(e.code==='Space'){ e.preventDefault(); if(!e.repeat) iniziaCarica(); }
   if(e.code==='ArrowLeft'||e.code==='ArrowRight') e.preventDefault();
   tasti[e.code]=true;
-  if(e.code==='KeyC' && G.fase!=='menu' && G.fase!=='trasforma' && G.fase!=='transizione') G.vistaAlto=!G.vistaAlto;
+  if(e.code==='KeyC' && !['menu','volo','trasforma','transizione'].includes(G.fase)) G.vistaAlto=!G.vistaAlto;
   if(e.code==='KeyM') commutaMusica();
   if(e.code==='Enter'){
-    if(G.fase==='trasforma') concludiTrasformazione();
+    if(G.fase==='volo') INTRO.salta();
+    else if(G.fase==='trasforma') concludiTrasformazione();
     else if(G.fase==='transizione') concludiTransizione();
     else if(!$('risultato').classList.contains('nascosto')) ($('btnProssima').classList.contains('nascosto')?($('btnFineGiro').classList.contains('nascosto')?$('btnAncora'):$('btnFineGiro')):$('btnProssima')).click();
     else if(!$('menu').classList.contains('nascosto') && !$('btnGioca').disabled) $('btnGioca').click();
@@ -11033,6 +11224,7 @@ addEventListener('keydown',e=>{
 });
 addEventListener('keyup',e=>{ tasti[e.code]=false; if(e.code==='Space') rilasciaTiro(); });
 canvas.addEventListener('click',()=>{
+  if(G.fase==='volo'){ INTRO.salta(); return; }
   if(G.fase==='trasforma'){ concludiTrasformazione(); return; }
   if(G.fase==='transizione'){ concludiTransizione(); return; }
   if((G.fase==='mira'||G.fase==='rotola') && canvas.requestPointerLock && document.pointerLockElement!==canvas) canvas.requestPointerLock();
@@ -11115,6 +11307,7 @@ function controllaQualita(ora){
 function passoFrame(dt){
   tGlob+=dt;
   if(G.fase==='menu') cameraMenu(dt);
+  else if(G.fase==='volo') INTRO.passo(dt);
   else if(G.fase==='trasforma'){ G.trasf.t+=dt; statoTrasformazione(G.trasf.t); if(G.trasf.t>=TR.fine && mascottePronta(G.M)) concludiTrasformazione(); }
   else if(G.fase==='transizione'){ G.trans.t+=dt; statoTransizione(G.trans.t); if(G.trans.t>=G.trans.durata && mascottePronta(G.M)) concludiTransizione(); }
   else {
