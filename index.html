@@ -11399,6 +11399,745 @@ function passoFrame(dt){
 }
 
 /* ==== EXTRA:INIZIO ==== (effetti di tutto il percorso, registrati con suEvento) */
+/* ---------------------------------------------------------------------
+   OGGETTI VIVI (chiave "oggetti") — tre effetti di solo aspetto e suono:
+   fisica, par e punti non cambiano. Tutto passa da suEvento().
+   1) LA OLA DEGLI iMAC — evento 'buca': gli schermi dei due tavoloni si accendono a onda
+      (6 m/s) nel colore della Casa, dal più vicino alla buca, poi torna il desktop. Emblema
+      preso: ola d'oro corta (raggio 3,5 m) che parte dall'emblema. Buca in uno: doppia ola
+      (Casa, poi oro) e due lampi a coppie dei pannelli LED del soffitto.
+      Tecnica: un "velo" per tavolone (una mesh figlia del tavolo) copiato una volta dalle
+      geometrie degli schermi, trovate per emissiveMap (SCHERMO_A/B e SCHERMO_DOC del docente),
+      senza toccare mkTavolone. Ogni vertice porta il centro del suo schermo (attributo aC):
+      lo schermo si accende tutto insieme. La distanza dall'origine dell'onda si calcola nello
+      shader in coordinate mondo (modelMatrix*aC), quindi vale per qualunque disposizione, anche
+      con i tavoli in volo. Un THREE.Points per tavolone fa l'alone (lato in metri:
+      proj[1][1]*H/2/-z), così l'onda si legge anche di taglio dalla camera bassa. Due canali
+      d'onda (uT/uO/uCol/uR e uT2/uO2/uCol2/uR2) con uniform condivise tra i materiali.
+      In mira l'ola si spegne in 0,25 s (anche dopo "Ancora", che non emette inizioBuca).
+   2) TOC! — evento 'urto' (che non porta coordinate): l'oggetto toccato si ritrova dalla
+      posizione della pallina, perché il contatto è a R dal centro; tolleranza = strada fatta
+      in un passo di fisica. Sedia: dondola sui piedi lontani (ruota la mesh figlia attorno a
+      un perno: il gruppo resta della disposizione, e la ola delle sedie della buca 2 non
+      interferisce). Girevole: la parte sopra (userData.sopra, la stessa divisione della buca 4)
+      fa 1-2 giri interi, rallenta e cigola. Termosifoni: dong con la sua nota (do mi sol do da
+      ovest a est) e un fremito. Porta della bussola: sbatacchia (se è chiusa). Bancone: il vaso
+      stampato traballa. LEGO: oscilla sulla base con un clac. Retina del canestro: ondeggia.
+      Ogni reazione salva la posa una volta sola e alla fine la rimette esatta; al cambio
+      buca, al menu, al cartellino, a 'riavvolto' e fuori dal gioco si chiudono tutte subito.
+   3) LE MELE D'ORO DELLA VETRATA — emblema preso: a 0,6 s una cometa d'oro (Bezier
+      quadratica con il controllo alto) parte dalla moneta e vola alla vetrata; a 1,4 s una
+      delle 26 mele bianche (sempre la stessa per ogni skill) diventa d'oro con un lampo e un
+      plin, e resta accesa (una per buca, al massimo 7).
+      Tecnica: le mele della vetrata sono casuali (rnd seminato), quindi si ritrovano leggendo
+      i pixel della sua canvas (componenti connesse, una volta sola) e confrontando ogni macchia
+      con una mela di riferimento; se ne tengono 7 isolate, da sinistra a destra. Le mele d'oro
+      stanno su una canvas trasparente in un piano 3 mm davanti alla vetrata (MeshBasic,
+      toneMapped false): il materiale della vetrata non cambia e non ricompila.
+      Si azzerano al 'menu', a 'riavvolto' e all'inizio di un giro nuovo.
+   RIDOTTO (prefers-reduced-motion): ola senza onda (tutti gli schermi insieme, una volta),
+   niente lampi LED, niente cometa (la mela si accende sul posto), Toc solo con il suono.
+   Prestazioni: geometrie e materiali creati una volta (e compilati nei primi fotogrammi);
+   nessuna allocazione per fotogramma; draw call in più solo mentre un effetto è attivo.
+   --------------------------------------------------------------------- */
+(()=>{
+  const PI=Math.PI, R=FISICA.COST.R;
+  const _v=new THREE.Vector3(), _q=new THREE.Quaternion(), _s=new THREE.Vector2();
+  const FASI_MIRA=new Set(['mira','carica','swing']);
+  const FASI_GIOCO=new Set(['mira','carica','swing','rotola','fine']);
+  const lineare=hex=>new THREE.Color(hex).convertSRGBToLinear();
+  const ORO=lineare(0xffc23d);
+  const DA_SCALDARE=[];                                     // visibili nei primi fotogrammi: i programmi si compilano subito
+
+  /* =============================== 1) OLA ============================== */
+  const VEL=RIDOTTO?1e4:6;
+  const U={uT:{value:-99}, uT2:{value:-99}, uVel:{value:VEL}, uR:{value:99}, uR2:{value:99}, uFade:{value:0},
+           uO:{value:new THREE.Vector2()}, uO2:{value:new THREE.Vector2()},
+           uCol:{value:new THREE.Color()}, uCol2:{value:new THREE.Color()}, uPx:{value:450}};
+  const GLSL_ONDA=`
+    uniform float uT,uT2,uVel,uR,uR2,uFade; uniform vec2 uO,uO2; uniform vec3 uCol,uCol2;
+    varying float vK; varying float vF; varying vec3 vCol;
+    void onda(vec3 w){
+      float d1=distance(w.xz,uO), d2=distance(w.xz,uO2);
+      float s1=uT-d1/uVel, s2=uT2-d2/uVel;
+      float g1=1.-smoothstep(uR*.6,uR,d1), g2=1.-smoothstep(uR2*.6,uR2,d2);
+      float k1=smoothstep(0.,.06,s1)*(1.-smoothstep(.32,.8,s1))*g1;
+      float k2=smoothstep(0.,.06,s2)*(1.-smoothstep(.32,.8,s2))*g2;
+      vF=max(smoothstep(0.,.04,s1)*(1.-smoothstep(.04,.14,s1))*g1, smoothstep(0.,.04,s2)*(1.-smoothstep(.04,.14,s2))*g2)*uFade;
+      vK=max(k1,k2)*uFade;
+      vCol=(uCol*k1+uCol2*k2)/max(k1+k2,1e-4);
+    }`;
+  const matVelo=new THREE.ShaderMaterial({uniforms:U, transparent:true, depthWrite:false, toneMapped:false,
+    polygonOffset:true, polygonOffsetFactor:-1, polygonOffsetUnits:-1,
+    vertexShader:GLSL_ONDA+`
+      attribute vec3 aC; varying vec2 vUv;
+      void main(){ onda((modelMatrix*vec4(aC,1.)).xyz); vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+    fragmentShader:`
+      varying float vK; varying float vF; varying vec3 vCol; varying vec2 vUv;
+      void main(){
+        if(vK<.003) discard;
+        gl_FragColor=vec4(vCol*(.78+.38*vUv.y)+vec3(.55*vF),min(1.,vK*.95+vF*.3));
+        #include <encodings_fragment>
+      }`});
+  const matAlone=new THREE.ShaderMaterial({uniforms:U, transparent:true, depthWrite:false, toneMapped:false, blending:THREE.AdditiveBlending,
+    vertexShader:GLSL_ONDA+`
+      uniform float uPx;
+      void main(){
+        vec4 w=modelMatrix*vec4(position,1.); onda(w.xyz);
+        vec4 mv=viewMatrix*w; gl_Position=projectionMatrix*mv;
+        gl_PointSize=vK>.003 ? min(uPx*.5, uPx*projectionMatrix[1][1]*.6*(.7+.3*vK)/max(.05,-mv.z)) : 1.;
+      }`,
+    fragmentShader:`
+      varying float vK; varying float vF; varying vec3 vCol;
+      void main(){
+        vec2 q=gl_PointCoord*2.-1.; float r=dot(q,q);
+        if(vK<.003 || r>1.) discard;
+        gl_FragColor=vec4(vCol*(1.+vF),(1.-r)*(1.-r)*vK*.6);
+        #include <encodings_fragment>
+      }`});
+  // velo + alone di un tavolone (figli del tavolo: lo seguono in ogni disposizione e nei salti)
+  function preparaTavolo(tav){
+    const P=[], C=[], UV=[], A=[];
+    const n=new THREE.Vector3(), c=new THREE.Vector3(), p=new THREE.Vector3();
+    for(const m of tav.children){
+      const mt=m.material;
+      if(!m.isMesh || !mt || !(mt.emissiveMap===SCHERMO_A || mt.emissiveMap===SCHERMO_B || mt.emissiveMap===SCHERMO_DOC)) continue;
+      const g=m.geometry.index?m.geometry.toNonIndexed():m.geometry, pos=g.attributes.position, nor=g.attributes.normal, uv=g.attributes.uv;
+      m.updateMatrix();
+      for(let i=0;i+5<pos.count;i+=6){                    // 6 vertici per schermo (piano non indicizzato)
+        c.set(0,0,0); for(let k=0;k<6;k++) c.x+=pos.getX(i+k), c.y+=pos.getY(i+k), c.z+=pos.getZ(i+k);
+        c.multiplyScalar(1/6).applyMatrix4(m.matrix); n.set(nor.getX(i),nor.getY(i),nor.getZ(i)).transformDirection(m.matrix);
+        for(let k=0;k<6;k++){
+          p.set(pos.getX(i+k),pos.getY(i+k),pos.getZ(i+k)).applyMatrix4(m.matrix).addScaledVector(n,.0015);
+          P.push(p.x,p.y,p.z); C.push(c.x,c.y,c.z); UV.push(uv?uv.getX(i+k):0, uv?uv.getY(i+k):0);
+        }
+        A.push(c.x+n.x*.05,c.y+.12,c.z+n.z*.05);
+      }
+    }
+    if(!A.length) return null;
+    const gv=new THREE.BufferGeometry();
+    gv.setAttribute('position',new THREE.Float32BufferAttribute(P,3)); gv.setAttribute('aC',new THREE.Float32BufferAttribute(C,3));
+    gv.setAttribute('uv',new THREE.Float32BufferAttribute(UV,2)); gv.computeBoundingSphere();
+    const ga=new THREE.BufferGeometry(); ga.setAttribute('position',new THREE.Float32BufferAttribute(A,3)); ga.computeBoundingSphere();
+    const velo=new THREE.Mesh(gv,matVelo), alone=new THREE.Points(ga,matAlone);
+    velo.renderOrder=5; alone.renderOrder=6; velo.name='olaVelo'; alone.name='olaAlone';
+    tav.add(velo); tav.add(alone); DA_SCALDARE.push(velo,alone);
+    return {tav, velo, alone, centri:new Float32Array(A)};
+  }
+  const TAV=ARREDO.tavoli.map(preparaTavolo).filter(Boolean);
+  // lampi a coppie dei pannelli LED (buca in uno): un alone additivo sotto ciascuno dei 4x2 pannelli
+  const LAMPI=(()=>{
+    const parti=[], K=[];
+    [-5.2,-1.8,1.8,5.0].forEach((x,k)=>{ for(const z of [-1.2,1.2]){ parti.push(pezzo(new THREE.PlaneGeometry(1.5,1.5),x,AULA.h-.024,z,PI/2)); for(let i=0;i<6;i++) K.push(k); } });
+    const g=unisci(parti); g.setAttribute('aK',new THREE.Float32BufferAttribute(K,1));
+    const m=new THREE.Mesh(g,new THREE.ShaderMaterial({uniforms:{uT:{value:-9}}, transparent:true, depthWrite:false, toneMapped:false, blending:THREE.AdditiveBlending,
+      vertexShader:`
+        attribute float aK; uniform float uT; varying float vA; varying vec2 vUv;
+        void main(){ float a=0.; for(int j=0;j<2;j++){ float tk=uT-aK*.11-float(j)*.62; a=max(a,exp(-tk*tk/.006)); }
+          vA=a; vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }`,
+      fragmentShader:`
+        varying float vA; varying vec2 vUv;
+        void main(){ float r=length(vUv-.5)*2.; float a=vA*(.65*(1.-smoothstep(.2,1.,r))+.5*(1.-smoothstep(.36,.4,r)));
+          if(a<.003) discard; gl_FragColor=vec4(1.,.93,.78,a);
+          #include <encodings_fragment>
+        }`}));
+    m.renderOrder=5; m.name='olaLampi'; soffitto.add(m); DA_SCALDARE.push(m);
+    return {m, t0:-1};
+  })();
+  const OLA={attiva:false, tA:-99, tB:-99, fine:0};
+  function mostraOla(s){ for(const T of TAV){ T.velo.visible=s; T.alone.visible=s; } }
+  function spegniOla(){ OLA.attiva=false; OLA.tA=OLA.tB=-99; U.uT.value=U.uT2.value=-99; U.uFade.value=0; mostraOla(false); LAMPI.m.visible=false; LAMPI.t0=-1; }
+  function distMax(x,z){
+    let d=0;
+    for(const T of TAV){ T.tav.updateMatrixWorld(); const c=T.centri;
+      for(let i=0;i<c.length;i+=3){ _v.set(c[i],c[i+1],c[i+2]).applyMatrix4(T.tav.matrixWorld); d=Math.max(d,Math.hypot(_v.x-x,_v.z-z)); } }
+    return d;
+  }
+  // canale 0 o 1; origine (x,z); colore lineare; ritardo (s); raggio massimo (m)
+  function avviaOla(canale,x,z,col,ritardo,raggio){
+    if(!TAV.length) return;
+    const t0=tGlob+ritardo;
+    if(canale===0){ OLA.tA=t0; U.uO.value.set(x,z); U.uCol.value.copy(col); U.uR.value=raggio; }
+    else { OLA.tB=t0; U.uO2.value.set(x,z); U.uCol2.value.copy(col); U.uR2.value=raggio; }
+    const durata=RIDOTTO?.85:Math.min(raggio,distMax(x,z))/VEL+.9;
+    OLA.fine=Math.max(OLA.attiva?OLA.fine:0,t0+durata);
+    OLA.attiva=true; U.uFade.value=1; mostraOla(true);
+  }
+  function coloreCasa(){
+    const k=CASE.find(c=>c.id===G.casa), c=new THREE.Color(k?k.css:'#1d5c39'), h={h:0,s:0,l:0};
+    c.getHSL(h); const vino=h.h<.05 || h.h>.93;             // Tassorosso resta bordeaux: mai un rosso da allarme
+    c.setHSL(h.h,Math.min(1,h.s*(vino?.85:1.1)),Math.max(h.l,vino?.34:.42)); return c.convertSRGBToLinear();
+  }
+  function olaBuca(){
+    const x=G.p.x, z=G.p.z;
+    avviaOla(0,x,z,coloreCasa(),0,99);
+    if(G.colpi===1 && !RIDOTTO){                             // buca in uno: doppia ola e lampi a coppie
+      avviaOla(1,x,z,ORO,.55,99);
+      LAMPI.t0=tGlob+.55; LAMPI.m.visible=true;
+    }
+  }
+  function olaEmblema(){ avviaOla(1,gEmblema.position.x,gEmblema.position.z,ORO,0,3.5); }
+
+  /* =============================== 2) TOC ============================== */
+  const REAZ=[];                                            // reazioni in corso: {o, tipo, t, d, ...posa salvata}
+  function cercaReaz(o){ for(let i=0;i<REAZ.length;i++) if(REAZ[i].o===o) return REAZ[i]; return null; }
+  function chiudiReaz(r){
+    const o=r.o;
+    if(r.tipo==='dondolo'){ o.position.copy(r.p0); o.quaternion.copy(r.q0); }
+    else if(r.tipo==='giro') o.rotation.y=r.base;
+    else if(r.tipo==='vibra'){ if(r.ch==='ry') o.rotation.y=r.base; else if(r.ch==='rz') o.rotation.z=r.base; else if(r.ch==='pz') o.position.z=r.base;
+      else { o.scale.y=r.base; o.position.y=r.y0; } }
+  }
+  function chiudiTutte(){ for(const r of REAZ) chiudiReaz(r); REAZ.length=0; }
+  function applica(r,u){
+    const o=r.o;
+    if(r.tipo==='dondolo'){                                 // rotazione attorno al perno P (asse A), solo verso l'alto
+      const a=r.amp*Math.abs(Math.sin(3*PI*u))*(1-u)*(1-u);
+      _q.setFromAxisAngle(r.A,a); o.quaternion.copy(_q).multiply(r.q0);
+      o.position.copy(r.p0).sub(r.P).applyQuaternion(_q).add(r.P);
+    } else if(r.tipo==='giro'){
+      const e=1-Math.pow(1-u,3); o.rotation.y=r.base+r.da+(r.a-r.da)*e;
+    } else {
+      const v=r.amp*Math.exp(-r.sm*u)*Math.sin(r.w*u);
+      if(r.ch==='ry') o.rotation.y=r.base+v; else if(r.ch==='rz') o.rotation.z=r.base+v; else if(r.ch==='pz') o.position.z=r.base+v;
+      else { o.scale.y=r.base*(1+v); o.position.y=r.y0+r.mezza*(r.base-o.scale.y); }   // la retina resta appesa all'anello
+    }
+  }
+  // dondolo: o ruota attorno a una retta orizzontale per (cx+dx*perno, 0, cz+dz*perno), coordinate del genitore
+  function dondola(o,cx,cz,dx,dz,perno,amp,d){
+    let r=cercaReaz(o);
+    if(!r){ r={o, tipo:'dondolo', p0:o.position.clone(), q0:o.quaternion.clone(), P:new THREE.Vector3(), A:new THREE.Vector3()}; REAZ.push(r); }
+    r.t=0; r.d=d; r.amp=amp; r.P.set(cx+dx*perno,0,cz+dz*perno); r.A.set(dz,0,-dx);
+  }
+  function vibra(o,ch,amp,w,sm,d){
+    let r=cercaReaz(o);
+    if(!r){ r={o, tipo:'vibra', ch, base:ch==='ry'?o.rotation.y:ch==='rz'?o.rotation.z:ch==='pz'?o.position.z:o.scale.y, y0:o.position.y, mezza:0}; REAZ.push(r); }
+    r.t=0; r.d=d; r.amp=amp; r.w=w; r.sm=sm;
+    return r;
+  }
+  function gira(s,v){
+    let r=cercaReaz(s), da=0;
+    if(r){ da=(((s.rotation.y-r.base)%(2*PI))+2*PI)%(2*PI); }   // nuovo colpo durante il giro: riparte da dov'è
+    else { r={o:s, tipo:'giro', base:s.rotation.y}; REAZ.push(r); }
+    const giri=v>2?2:1;
+    r.t=0; r.da=da; r.a=2*PI*(Math.ceil(da/(2*PI)-1e-6)+giri); r.d=1.25+.45*giri;
+  }
+  // parte "sopra" della girevole: stessa divisione della buca 4 (pistone, seduta, schienale)
+  function sopraGirevole(){
+    const g=ARREDO.girevole; if(!g) return null;
+    if(!g.userData.sopra){ const s=new THREE.Group(); s.name='girevole_sopra';
+      for(const c of g.children.slice()) if(c.isMesh && c.position.y>.2) s.add(c);
+      g.add(s); g.userData.sopra=s; }
+    return g.userData.sopra;
+  }
+  const TERMO=AULA.finestre.map(([a,b])=>{
+    const nEl=Math.floor((b-a-.4)/.09), xc=(a+b)/2, hw=nEl*.09/2;
+    const mesh=aula.children.find(o=>{ if(!o.isMesh || Math.abs(o.position.z-(AULA.zF-.12))>1e-4 || o.position.x!==0) return false;
+      const g=o.geometry; if(!g.boundingBox) g.computeBoundingBox(); const bb=g.boundingBox;
+      return Math.abs((bb.min.x+bb.max.x)/2-xc)<.05 && bb.max.y-bb.min.y>.5 && bb.max.y<.85; })||null;
+    return {x0:xc-hw-.06, x1:xc+hw+.06, xc, mesh};
+  }).sort((p,q)=>p.xc-q.xc);
+  [262,330,392,523].forEach((f,i)=>{ if(TERMO[i]) TERMO[i].nota=f; });
+  const B=.05, BAN=AULA.bancone, ZW=AULA.zP;
+  const VASO=aula.children.find(o=>o.isMesh && o.geometry.type==='LatheGeometry' && Math.abs(o.position.x-(BAN.x1-.5))<1e-3)||null;
+  const RETE=aula.children.find(o=>o.isMesh && o.geometry.type==='CylinderGeometry' && o.geometry.parameters.radiusTop===.19 && o.geometry.parameters.radiusBottom===.11)||null;
+  const LEGO_G=aula.children.find(o=>o.isGroup && Math.abs(o.position.x-LEGO.x)<1e-4 && Math.abs(o.position.z-LEGO.z)<1e-4)||null;
+  const MESH_SEDIA=new Map();
+  for(const s of ARREDO.sedie){ const m=s.children.find(c=>c.isMesh && c.geometry===GEO_SEDIA); if(m) MESH_SEDIA.set(s,m); }
+  const ULT=new Map();                                      // ultimo Toc per oggetto (niente raffiche)
+  function puoi(k){ const t=ULT.get(k)||-9; if(tGlob-t<.12) return false; ULT.set(k,tGlob); return true; }
+
+  function suonoSedia(d){ tono(860,.035,'triangle',.05,d*.33); tono(800,.03,'triangle',.035,d*.66); }
+  function toc(e){
+    const p=G.p; if(!p || e.v<.15 || p.liv===1) return;
+    const px=p.x, pz=p.z, tol=Math.hypot(p.vx,p.vz)*DT_FIS+.012, forza=Math.min(1,e.v/3);
+    // sedie e girevole: i cerchi degli ingombri (gambe, ruote, colonna)
+    let best=null, bg=tol;
+    for(const o of ARREDO.tutti){
+      const ing=o.userData.ingombro; if(!ing || !ing.cerchi || o.position.y>.05) continue;
+      const cs=Math.cos(o.rotation.y), sn=Math.sin(o.rotation.y);
+      for(const q of ing.cerchi){ const x=o.position.x+q[0]*cs+q[1]*sn, z=o.position.z-q[0]*sn+q[1]*cs;
+        const g=Math.hypot(px-x,pz-z)-q[2]-R; if(g<bg){ bg=g; best=o; } }
+    }
+    if(best && best===ARREDO.girevole){
+      if(!puoi(best)) return;
+      tono(1150,.2,'triangle',.03,0,800); tono(900,.3,'triangle',.022,.75,640);
+      const s=sopraGirevole(); if(s && !RIDOTTO) gira(s,e.v);
+      return;
+    }
+    if(best){
+      if(!puoi(best)) return;
+      const d=.6; suonoSedia(d);
+      const m=MESH_SEDIA.get(best); if(!m || RIDOTTO) return;
+      const ry=best.rotation.y, cs=Math.cos(ry), sn=Math.sin(ry), wx=px-best.position.x, wz=pz-best.position.z;
+      const lx=wx*cs-wz*sn, lz=wx*sn+wz*cs, l=Math.hypot(lx,lz)||1;        // pallina nel sistema della sedia
+      dondola(m,0,0,-lx/l,-lz/l,.22,(1.5+3.5*forza)*PI/180,d);
+      return;
+    }
+    // omino LEGO
+    if(LEGO_G && FISICA.dentroRett(px,pz,{cx:LEGO.x,cz:LEGO.z,w:.52+2*(R+tol),d:.34+2*(R+tol),ry:LEGO.ry})){
+      if(!puoi(LEGO_G)) return;
+      tono(1250,.03,'triangle',.06); rumore(.02,.05,4000); tono(1100,.03,'triangle',.04,.27);
+      if(RIDOTTO) return;
+      const dx=LEGO.x-px, dz=LEGO.z-pz, l=Math.hypot(dx,dz)||1;
+      dondola(LEGO_G,LEGO_G.position.x,LEGO_G.position.z,dx/l,dz/l,.2,2*PI/180,.8);
+      return;
+    }
+    // bussole: la porta sbatacchia (solo se è chiusa)
+    for(let i=0;i<AULA.bussole.length;i++){ const bs=AULA.bussole[i];
+      if(px>bs.x0-B-R-tol && px<bs.x1+B+R+tol && pz<bs.z+B+R+tol){
+        if(!puoi('bussola'+i)) return;
+        rumore(.05,.06,700); tono(140,.08,'triangle',.06); rumore(.04,.035,700,.09);
+        const porta=PORTE[i]; if(porta && !RIDOTTO && Math.abs(porta.rotation.y)<.02) vibra(porta,'ry',.012+.01*forza,46,4.5,.7);
+        return;
+      }
+    }
+    // bancone: il vaso stampato traballa
+    if(px>BAN.x0 && px<BAN.x1 && pz<ZW+BAN.prof+B+R+tol){
+      if(!puoi('bancone')) return;
+      tono(1500,.06,'triangle',.035); tono(1750,.05,'triangle',.03,.08); tono(1600,.04,'triangle',.02,.16);
+      if(VASO && !RIDOTTO) vibra(VASO,'rz',.05+.04*forza,26,4,.9);
+      return;
+    }
+    // parete sotto il canestro: la retina ondeggia
+    if(RETE && Math.abs(px+5.1)<.35 && pz<ZW+B+R+tol){
+      if(!puoi('rete')) return;
+      rumore(.14,.06,2600); rumore(.1,.03,5000,.03);
+      if(!RIDOTTO){ const r=vibra(RETE,'sy',.15,30,5,.9); r.mezza=RETE.geometry.parameters.height/2; }
+      return;
+    }
+    // termosifoni sotto le finestre: dong con la sua nota
+    if(pz>AULA.zF-B-R-tol) for(const T of TERMO){
+      if(px>T.x0 && px<T.x1){
+        if(!puoi(T)) return;
+        const f=T.nota||330; tono(f,.6,'sine',.08); tono(f*2.76,.3,'sine',.028); tono(f*5.4,.15,'sine',.012);
+        if(T.mesh && !RIDOTTO) vibra(T.mesh,'pz',.0025,80,6,.45);
+        return;
+      }
+    }
+  }
+
+  /* ============================ 3) MELE D'ORO =========================== */
+  const MELE=(()=>{
+    let vet=null;
+    aula.traverse(o=>{ const im=o.isMesh && o.material && o.material.map && o.material.map.image;
+      if(!vet && im && im.width===1024 && im.height===328 && im.getContext) vet=o; });
+    if(!vet) return null;
+    const W=vet.geometry.parameters.width, H=vet.geometry.parameters.height;
+    // mela di riferimento (s=40): ingombro, area e posizione del centro dentro l'ingombro
+    const rc=mkCanvas(96,96), rg=rc.getContext('2d'); melaApple(rg,48,48,40,'#fff');
+    const rd=rg.getImageData(0,0,96,96).data; let x0=96,x1=0,y0=96,y1=0,ar=0;
+    for(let y=0;y<96;y++) for(let x=0;x<96;x++) if(rd[(y*96+x)*4+3]>127){ ar++; if(x<x0)x0=x; if(x>x1)x1=x; if(y<y0)y0=y; if(y>y1)y1=y; }
+    const RW=(x1-x0+1)/40, RH=(y1-y0+1)/40, RA=ar/1600, OL=(48-x0)/40, OT=(48-y0)/40;
+    // macchie chiare sulla vetrata (componenti connesse, 4-vicini)
+    const cw=1024, ch=328, dat=vet.material.map.image.getContext('2d').getImageData(0,0,cw,ch).data;
+    const vis=new Uint8Array(cw*ch), pila=new Int32Array(cw*ch), cand=[];
+    for(let i0=0;i0<cw*ch;i0++){
+      if(vis[i0] || dat[i0*4]<150) continue;
+      let sp=0, n=0, a=cw, b=0, c=ch, d=0; pila[sp++]=i0; vis[i0]=1;
+      while(sp){ const i=pila[--sp], x=i%cw, y=(i/cw)|0; n++; if(x<a)a=x; if(x>b)b=x; if(y<c)c=y; if(y>d)d=y;
+        if(x>0 && !vis[i-1] && dat[(i-1)*4]>=150){ vis[i-1]=1; pila[sp++]=i-1; }
+        if(x<cw-1 && !vis[i+1] && dat[(i+1)*4]>=150){ vis[i+1]=1; pila[sp++]=i+1; }
+        if(y>0 && !vis[i-cw] && dat[(i-cw)*4]>=150){ vis[i-cw]=1; pila[sp++]=i-cw; }
+        if(y<ch-1 && !vis[i+cw] && dat[(i+cw)*4]>=150){ vis[i+cw]=1; pila[sp++]=i+cw; } }
+      const w=b-a+1, h=d-c+1, s=h/RH;
+      if(n>60 && Math.abs(w/h-RW/RH)<.12 && Math.abs(n/(s*s)-RA)<RA*.15) cand.push({cx:a+OL*s, cy:c+OT*s, s});
+    }
+    cand.sort((p,q)=>p.cx-q.cx);
+    const POS=[];
+    for(let i=0;i<7;i++){
+      const m=cand.length>=7 ? cand[Math.round(i*(cand.length-1)/6)] : {cx:110+i*134, cy:164, s:14};   // riserva: 7 mele nuove in fila
+      POS.push(m);
+    }
+    // mela d'oro pronta (s=40) e canvas trasparente sopra la vetrata
+    const mc=mkCanvas(96,96), mg=mc.getContext('2d'); melaApple(mg,48,48,40,'#ffd28a');
+    mg.globalCompositeOperation='source-atop'; const lg=mg.createLinearGradient(20,10,70,90);
+    lg.addColorStop(0,'rgba(255,250,225,.75)'); lg.addColorStop(.45,'rgba(255,214,120,0)'); lg.addColorStop(1,'rgba(176,112,20,.45)');
+    mg.fillStyle=lg; mg.fillRect(0,0,96,96);
+    const oc=mkCanvas(1024,328), og=oc.getContext('2d'), ot=tex(oc);
+    const mat=new THREE.MeshBasicMaterial({map:ot, transparent:true, depthWrite:false, toneMapped:false,
+      polygonOffset:true, polygonOffsetFactor:-2, polygonOffsetUnits:-2});
+    MATS.add(mat);
+    const ov=new THREE.Mesh(vet.geometry,mat); ov.name='meleOro';
+    ov.position.copy(vet.position); ov.quaternion.copy(vet.quaternion); ov.translateZ(.003); ov.renderOrder=3;
+    vet.parent.add(ov); ov.updateWorldMatrix(true,false); DA_SCALDARE.push(ov);
+    for(const m of POS) m.w=ov.localToWorld(new THREE.Vector3((m.cx/1024-.5)*W,(.5-m.cy/328)*H,.03));
+    const trovate=[false,false,false,false,false,false,false];
+    function disegna(){
+      og.clearRect(0,0,1024,328); let n=0;
+      for(let i=0;i<7;i++){ if(!trovate[i]) continue; n++; const m=POS[i], k=m.s*1.22/40;
+        og.save(); og.shadowColor='rgba(255,190,70,1)';
+        for(const bl of [m.s*1.6,m.s*.6]){ og.shadowBlur=bl; og.drawImage(mc,m.cx-48*k,m.cy-48*k,96*k,96*k); }
+        og.restore(); }
+      ot.needsUpdate=true; ov.visible=n>0;
+    }
+    // cometa: testa (sprite) + scia (Points con colori che sfumano), lampo sulla mela
+    const gc=mkCanvas(64,64), gg=gc.getContext('2d'), gr=gg.createRadialGradient(32,32,0,32,32,32);
+    gr.addColorStop(0,'rgba(255,250,225,1)'); gr.addColorStop(.25,'rgba(255,214,120,.85)'); gr.addColorStop(1,'rgba(255,170,40,0)');
+    gg.fillStyle=gr; gg.fillRect(0,0,64,64); const glow=tex(gc);
+    const spr=()=>{ const m=new THREE.SpriteMaterial({map:glow, transparent:true, depthWrite:false, toneMapped:false, blending:THREE.AdditiveBlending}); MATS.add(m);
+      const s=new THREE.Sprite(m); s.renderOrder=7; scene.add(s); DA_SCALDARE.push(s); return s; };
+    const testa=spr(), lampo=spr(); testa.scale.setScalar(.24);
+    const NS=42, sp=new Float32Array(NS*3), sc=new Float32Array(NS*3), sg=new THREE.BufferGeometry();
+    sg.setAttribute('position',new THREE.BufferAttribute(sp,3)); sg.setAttribute('color',new THREE.BufferAttribute(sc,3));
+    const smat=new THREE.PointsMaterial({size:.1, map:glow, vertexColors:true, transparent:true, depthWrite:false, toneMapped:false, blending:THREE.AdditiveBlending});
+    MATS.add(smat);
+    const scia=new THREE.Points(sg,smat); scia.frustumCulled=false; scia.renderOrder=7; scene.add(scia); DA_SCALDARE.push(scia);
+    const CO={on:false, t:0, i:-1, via:false, coda:0, lampo:-1, P0:new THREE.Vector3(), P1:new THREE.Vector3(), P2:new THREE.Vector3()};
+    function nascondiCometa(){ testa.visible=false; scia.visible=false; CO.coda=0; }
+    function accendi(i){
+      trovate[i]=true; disegna();
+      lampo.position.copy(POS[i].w); lampo.visible=true; CO.lampo=0;
+      tono(1568,.35,'sine',.06); tono(2349,.3,'sine',.045,.06);
+    }
+    function prendi(i){ if(i<0 || i>6 || trovate[i] || (CO.on && CO.i===i)) return; if(CO.on) completa(); CO.on=true; CO.t=0; CO.i=i; CO.via=false; }
+    function completa(){ if(CO.on){ CO.on=false; accendi(CO.i); } nascondiCometa(); }
+    function azzera(){ CO.on=false; nascondiCometa(); lampo.visible=false; CO.lampo=-1; trovate.fill(false); disegna(); }
+    function scia0(){ for(let i=0;i<NS;i++){ sp[i*3]=CO.P0.x; sp[i*3+1]=CO.P0.y; sp[i*3+2]=CO.P0.z; } sc.fill(0); }
+    function frame(dt){
+      if(CO.on){
+        CO.t+=dt;
+        if(!CO.via && CO.t>=.6){
+          CO.via=true;
+          if(RIDOTTO){ CO.on=false; accendi(CO.i); return; }
+          if(monetaEmblema && gEmblema.visible) monetaEmblema.getWorldPosition(CO.P0); else CO.P0.copy(gEmblema.position).setY(gEmblema.position.y+.6);
+          CO.P2.copy(POS[CO.i].w);
+          CO.P1.addVectors(CO.P0,CO.P2).multiplyScalar(.5); CO.P1.y=Math.min(AULA.h-.35,Math.max(CO.P0.y,CO.P2.y)+1.5);
+          scia0(); testa.visible=true; scia.visible=true; testa.material.opacity=1;
+        }
+        if(CO.via){
+          const u=clamp01((CO.t-.6)/.8);
+          for(let j=2;j>=0;j--){                            // 3 campioni per fotogramma lungo la curva: scia continua
+            const uj=Math.max(0,u-j*dt/2.4), e=uj*uj*(3-2*uj), a=(1-e)*(1-e), b=2*e*(1-e), c=e*e;
+            testa.position.set(a*CO.P0.x+b*CO.P1.x+c*CO.P2.x, a*CO.P0.y+b*CO.P1.y+c*CO.P2.y, a*CO.P0.z+b*CO.P1.z+c*CO.P2.z);
+            sp.copyWithin(3,0,(NS-1)*3);
+            sp[0]=testa.position.x+(Math.random()-.5)*.035; sp[1]=testa.position.y+(Math.random()-.5)*.035; sp[2]=testa.position.z+(Math.random()-.5)*.035;
+          }
+          for(let i=0;i<NS;i++){ const k=Math.pow(1-i/NS,1.6); sc[i*3]=k; sc[i*3+1]=k*.78; sc[i*3+2]=k*.36; }
+          sg.attributes.position.needsUpdate=true; sg.attributes.color.needsUpdate=true;
+          if(u>=1){ CO.on=false; accendi(CO.i); testa.visible=false; CO.coda=.35; }
+        }
+      }
+      if(CO.coda>0){ CO.coda-=dt; const k=Math.max(0,CO.coda/.35);
+        for(let i=0;i<NS*3;i++) sc[i]*=k>0?.88:0; sg.attributes.color.needsUpdate=true; if(CO.coda<=0) scia.visible=false; }
+      if(CO.lampo>=0){ CO.lampo+=dt; const u=CO.lampo/(RIDOTTO?.9:.55);
+        if(u>=1){ CO.lampo=-1; lampo.visible=false; }
+        else if(RIDOTTO){ lampo.scale.setScalar(.35); lampo.material.opacity=1-u; }
+        else { lampo.scale.setScalar(.12+.5*Math.sin(PI*Math.min(1,u*1.6))*(1-u*.5)); lampo.material.opacity=1-u*u; } }
+    }
+    return {prendi, completa, azzera, frame, POS, trovate, ov};
+  })();
+
+  /* ============================== AGGANCI ============================== */
+  suEvento('evento',e=>{
+    if(e.tipo==='urto') toc(e);
+    else if(e.tipo==='trigger' && e.id==='emblema' && !G.emblema){
+      olaEmblema();
+      if(MELE && BUCHE[G.bucaIdx]) MELE.prendi(BUCHE[G.bucaIdx].skill);
+    } else if(e.tipo==='buca') olaBuca();
+  });
+  suEvento('cambioBuca',()=>{ chiudiTutte(); if(MELE) MELE.completa(); });
+  suEvento('inizioBuca',b=>{
+    chiudiTutte(); spegniOla();
+    if(MELE && b===BUCHE[0] && !(G.cartellino && G.cartellino.length)) MELE.azzera();   // giro nuovo (anche senza passare dal menu)
+  });
+  suEvento('cartellino',()=>{ chiudiTutte(); if(MELE) MELE.completa(); });
+  suEvento('menu',()=>{ chiudiTutte(); spegniOla(); if(MELE) MELE.azzera(); });
+  suEvento('riavvolto',()=>{ chiudiTutte(); if(MELE) MELE.azzera(); });
+  let scalda=2;
+  for(const o of DA_SCALDARE){ o.visible=true; if(o.isSprite) o.material.opacity=0; }
+  suEvento('frame',(dt,t)=>{
+    if(scalda>0 && --scalda===0){
+      for(const o of DA_SCALDARE){ o.visible=false; if(o.isSprite) o.material.opacity=1; }
+      if(MELE) MELE.azzera();
+      if(OLA.attiva) mostraOla(true);
+      LAMPI.m.visible=LAMPI.t0>=0;
+    }
+    // ola: tempi nello shader; in mira si spegne
+    if(OLA.attiva){
+      U.uT.value=t-OLA.tA; U.uT2.value=t-OLA.tB;
+      if(FASI_MIRA.has(G.fase)) U.uFade.value=Math.max(0,U.uFade.value-dt*4);
+      renderer.getDrawingBufferSize(_s); U.uPx.value=_s.y/2;
+      if(LAMPI.t0>=0){ LAMPI.m.material.uniforms.uT.value=t-LAMPI.t0; if(t-LAMPI.t0>1.3){ LAMPI.t0=-1; LAMPI.m.visible=false; } }
+      if(t>OLA.fine || U.uFade.value<=0) spegniOla();
+    }
+    // Toc: reazioni in corso (fuori dal gioco si chiudono tutte)
+    if(REAZ.length){
+      if(!FASI_GIOCO.has(G.fase)) chiudiTutte();
+      else for(let i=REAZ.length-1;i>=0;i--){ const r=REAZ[i]; r.t+=dt;
+        if(r.t>=r.d){ chiudiReaz(r); REAZ[i]=REAZ[REAZ.length-1]; REAZ.length--; }
+        else applica(r,r.t/r.d); }
+    }
+    if(MELE) MELE.frame(dt);
+  });
+})();
+
+/* ---------------------------------------------------------------------
+   TABELLONE PER IL PROIETTORE (index.html?tabellone=1) — e suoni delle mazze
+   Cosa fa: sul PC del docente collegato al proiettore niente menu e niente gioco.
+   Sopra la scena del laboratorio (G.fase resta 'menu', quindi passoFrame continua a
+   girare lenta la camera del menu) compare a tutto schermo la Sfida tra Casate:
+   le 4 Case ordinate per punti (ritratto della mascotte, barra, 7 skill accese o
+   spente), la Top 10 dei giocatori e l'etichetta della sfida attiva. Ogni 12 s
+   rilegge il Foglio (action=case, come leggiTotali) e ridisegna con totaliCorrenti():
+   i punti salgono contando, le righe si scambiano scivolando quando una Casa ne
+   supera un'altra ("Sorpasso!"), le skill appena trovate si accendono con un guizzo.
+   Se la rete non risponde restano gli ultimi dati e compare una nota ambra discreta.
+   Doppio clic o F: schermo intero. Il puntatore sparisce dopo 3 s fermo; lo schermo
+   resta acceso (Wake Lock, dove il browser lo permette).
+   Tecnica riusabile:
+   - unità --u = min(1vh, .5625vw) su un contenitore 16:9 centrato: lo stesso layout
+     sta su proiettori 16:9, 16:10 e 4:3; il testo più piccolo è 2u (~22 px a 1080p).
+   - classifica animata senza FLIP: righe absolute con transform translateY(rango*passo)
+     e transition CSS; basta cambiare il rango e il browser fa lo scambio.
+   - ritratti 3D in 2D: ogni mascotte resa una volta in un WebGLRenderTarget con una
+     mini-scena (luci sue, scene.environment), letta con readRenderTargetPixels e
+     copiata capovolta su un canvas -> dataURL. Nessuna allocazione per fotogramma.
+   - fetch con AbortController (9 s): un Apps Script appeso non blocca il tabellone.
+   Prova senza Foglio: con URL_CLASSIFICA vuoto mostra i punti di oggi di questo computer.
+   Suoni delle mazze: le 7 mazze (mazza1..mazza7) hanno già il loro suono() che
+   eseguiTiro suona al colpo (megafono, POF, clack, tic-tic, clonk, splosh, BOING):
+   restano come sono, qui non si aggiunge nulla.
+   --------------------------------------------------------------------- */
+(()=>{
+  const q=PARAM.get('tabellone');
+  if(q===null || q==='0' || q==='no') return;
+
+  const PERIODO=12000, PASSO=19.8;                 // ms tra le letture; passo verticale delle righe (u)
+  const ICONE=SKILL.map((s,i)=>canvasSkill(i).toDataURL());
+  // colore della Casa reso leggibile sul blu del pannello: stessa tinta, luminosità almeno 46%
+  function chiaro(hex){
+    const n=parseInt(hex.slice(1),16), r=(n>>16&255)/255, g=(n>>8&255)/255, b=(n&255)/255;
+    const mx=Math.max(r,g,b), mn=Math.min(r,g,b), l=(mx+mn)/2, d=mx-mn;
+    let h=0, s=0;
+    if(d){ s=d/(1-Math.abs(2*l-1)); h=mx===r?((g-b)/d)%6:mx===g?(b-r)/d+2:(r-g)/d+4; h*=60; if(h<0) h+=360; }
+    return 'hsl('+h.toFixed(0)+','+(Math.min(.85,s*1.1)*100).toFixed(0)+'%,'+(Math.max(.46,l)*100).toFixed(0)+'%)';
+  }
+  const COL={}; CASE.forEach(c=>COL[c.id]=chiaro(c.css));
+
+  // ---------- stile (iniettato: il blocco resta unico) ----------
+  const U=n=>'calc(var(--u)*'+n+')';
+  const st=document.createElement('style');
+  st.textContent=`
+  #tab{--u:min(1vh,.5625vw);position:fixed;left:50%;top:50%;width:${U(177.78)};height:${U(100)};
+    transform:translate(-50%,-50%);z-index:30;pointer-events:none;color:#f4f7ff;
+    font-family:'Lexend',system-ui,Helvetica,Arial,sans-serif;font-variant-numeric:tabular-nums}
+  #tab .tp{position:absolute;background:rgba(9,27,66,.88);border:${U(.15)} solid rgba(255,255,255,.16);
+    border-radius:${U(2.2)};box-shadow:0 ${U(1)} ${U(4)} rgba(0,0,0,.35)}
+  #tab .testa{left:${U(3)};top:${U(2.2)};height:${U(9.6)};padding:0 ${U(2.6)};display:flex;flex-direction:column;justify-content:center}
+  #tab .testa small{font-size:${U(2.2)};font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:#ffd28a}
+  #tab .testa h1{font-size:${U(5.2)};font-weight:800;line-height:1.05;letter-spacing:.01em}
+  #tab .sfida{right:${U(3)};top:${U(2.2)};height:${U(9.6)};padding:0 ${U(2.6)};display:flex;flex-direction:column;justify-content:center;align-items:flex-end;max-width:${U(40)}}
+  #tab .sfida .et{font-size:${U(2)};letter-spacing:.14em;text-transform:uppercase;opacity:.72}
+  #tab .sfida b{font-size:${U(3.6)};font-weight:800;color:#ffd28a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  #tab .rete{font-size:${U(2)};opacity:.7;margin-top:${U(.3)};white-space:nowrap}
+  #tab .rete.ko{opacity:1;color:#e0a030}
+  #tab .rete.ko:before{content:'';display:inline-block;width:${U(1.3)};height:${U(1.3)};border-radius:50%;background:#e0a030;margin-right:${U(.8)};vertical-align:middle}
+  #tab .case{left:${U(3)};top:${U(14)};width:${U(108)};height:${U(82)}}
+  #tab .casa{position:absolute;left:${U(1.6)};right:${U(1.6)};top:${U(1.6)};height:${U(18.6)};border-radius:${U(1.8)};
+    display:grid;grid-template-columns:${U(6.5)} ${U(15)} 1fr ${U(23)};align-items:center;column-gap:${U(2)};padding:0 ${U(2.2)} 0 ${U(1.2)};
+    background:linear-gradient(90deg,var(--t) 0%,rgba(255,255,255,.04) 62%);border:${U(.25)} solid rgba(255,255,255,.08);
+    transition:transform 1.2s cubic-bezier(.55,0,.25,1),border-color .6s,box-shadow .6s}
+  #tab .casa.primo{border-color:rgba(255,210,138,.85)}
+  #tab .casa.sale{z-index:2;box-shadow:0 0 ${U(3.5)} rgba(255,210,138,.75);border-color:#ffd28a;animation:tbSale 1.2s ease-in-out 2}
+  @keyframes tbSale{50%{box-shadow:0 0 ${U(6)} rgba(255,210,138,.95)}}
+  #tab .pos{font-size:${U(5.4)};font-weight:800;text-align:center;opacity:.92}
+  #tab .casa.primo .pos{color:#ffd28a}
+  #tab .ritr{width:${U(15)};height:${U(15)};border-radius:50%;overflow:hidden;border:${U(.45)} solid rgba(255,255,255,.75);
+    background:radial-gradient(circle at 50% 35%,var(--c2),var(--c) 75%);display:flex;align-items:center;justify-content:center;
+    font-size:${U(7)};font-weight:800}
+  #tab .ritr img{width:100%;height:100%;display:block}
+  #tab .nome{font-size:${U(4.8)};font-weight:800;line-height:1.1;white-space:nowrap}
+  #tab .barra{position:relative;height:${U(2.6)};border-radius:${U(1.3)};background:rgba(255,255,255,.14);overflow:hidden;margin:${U(1)} 0 ${U(1.2)}}
+  #tab .barra i{position:absolute;left:0;top:0;bottom:0;border-radius:${U(1.3)};background:var(--c2);width:0;transition:width 1.2s cubic-bezier(.3,0,.2,1)}
+  #tab .sk{display:flex;gap:${U(.8)}}
+  #tab .sk img{width:${U(4.4)};height:${U(4.4)};transition:filter .8s,opacity .8s}
+  #tab .sk img.off{filter:grayscale(1) brightness(.75);opacity:.28}
+  #tab .sk img.nuova{animation:tbSkill 1.1s cubic-bezier(.3,1.6,.5,1)}
+  @keyframes tbSkill{0%{transform:scale(.4)}45%{transform:scale(1.5);filter:drop-shadow(0 0 ${U(1.2)} #ffd28a)}100%{transform:scale(1)}}
+  #tab .punti{text-align:right;line-height:1}
+  #tab .punti b{display:block;font-size:${U(8.6)};font-weight:800}
+  #tab .punti small{font-size:${U(2.2)};opacity:.72;letter-spacing:.1em;text-transform:uppercase}
+  #tab .top{left:${U(114)};top:${U(14)};width:${U(60.78)};height:${U(82)};padding:${U(2)} ${U(2)} 0}
+  #tab .top h2{font-size:${U(2.8)};font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:#ffd28a;margin:0 0 ${U(1.2)} ${U(.6)}}
+  #tab .top ol{list-style:none;margin:0;padding:0}
+  #tab .top li{height:${U(6.9)};display:grid;grid-template-columns:${U(5)} 1fr auto;align-items:center;column-gap:${U(1.4)};
+    border-left:${U(.8)} solid var(--c2);border-radius:${U(.8)};padding:0 ${U(1.6)} 0 ${U(.6)};margin-bottom:${U(.3)}}
+  #tab .top li:nth-child(odd){background:rgba(255,255,255,.05)}
+  #tab .top li .n{font-size:${U(2.8)};font-weight:800;opacity:.8;text-align:right}
+  #tab .top li .chi{min-width:0;line-height:1.12}
+  #tab .top li .chi span{display:block;font-size:${U(3.3)};font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #tab .top li .chi em{display:block;font-style:normal;font-size:${U(2.1)};color:rgba(244,247,255,.68);font-weight:600}
+  #tab .top li b{font-size:${U(3.8)};font-weight:800}
+  #tab .top li.su{animation:tbSu 3s ease-out}
+  @keyframes tbSu{0%,25%{background:rgba(255,210,138,.38)}}
+  #tab .top .vuoto{font-size:${U(3)};opacity:.7;padding:${U(2)} ${U(.6)}}
+  #tab .sorpasso{left:${U(66)};right:${U(44)};top:${U(2.2)};height:${U(9.6)};transform:scale(.92);display:flex;flex-direction:column;
+    align-items:center;justify-content:center;white-space:nowrap;opacity:0;transition:opacity .5s,transform .5s;border-color:#ffd28a}
+  #tab .sorpasso small{font-size:${U(2.2)};font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:#ffd28a}
+  #tab .sorpasso div{font-size:${U(3.3)};font-weight:600}
+  #tab .sorpasso b{font-weight:800}
+  #tab .sorpasso.vivo{opacity:1;transform:scale(1)}
+  #tab .aiuto{left:50%;bottom:${U(.6)};transform:translateX(-50%);font-size:${U(2)};padding:${U(.4)} ${U(1.6)};opacity:0;transition:opacity .6s;border-radius:${U(1)}}
+  #tab .aiuto.vivo{opacity:.85}
+  body.tbNoCur,body.tbNoCur *{cursor:none!important}
+  @media (prefers-reduced-motion:reduce){
+    #tab .casa,#tab .barra i,#tab .sk img,#tab .sorpasso,#tab .aiuto{transition:none}
+    #tab .casa.sale,#tab .sk img.nuova,#tab .top li.su{animation:none}
+    #tab .top li.su{background:rgba(255,210,138,.22)}
+  }`;
+  document.head.appendChild(st);
+
+  // ---------- il gioco resta al menu, ma senza menu né comandi ----------
+  for(const id of ['menu','hud','aiuto','sfidaCase','barraPot','btnMusica','risultato','cartellino']){ const e=$(id); if(e) e.classList.add('nascosto'); }
+  document.title='Tabellone — Minigolf delle Skill';
+
+  // ---------- struttura ----------
+  const el=(tag,cls,txt)=>{ const e=document.createElement(tag); if(cls) e.className=cls; if(txt!=null) e.textContent=txt; return e; };
+  const tab=el('div'); tab.id='tab';
+  const testa=el('div','tp testa'); testa.append(el('small',null,'Minigolf delle Skill'),el('h1',null,'Sfida tra Casate'));
+  const sfida=el('div','tp sfida'), sfEt=el('span','et','Sfida attiva'), sfNome=el('b',null,'—'), rete=el('div','rete','');
+  sfida.append(sfEt,sfNome,rete);
+  const banda=el('div','tp sorpasso');
+  const pCase=el('div','tp case'), pTop=el('div','tp top'), lista=el('ol');
+  pTop.append(el('h2',null,'Migliori giocatori'),lista);
+  const aiuto=el('div','tp aiuto','Doppio clic: schermo intero');
+  const R={};                                      // righe delle Case
+  CASE.forEach((c,k)=>{
+    const r=el('div','casa'); r.style.setProperty('--c',c.css); r.style.setProperty('--c2',COL[c.id]);
+    const n=parseInt(c.css.slice(1),16); r.style.setProperty('--t','rgba('+(n>>16&255)+','+(n>>8&255)+','+(n&255)+',.55)');
+    const pos=el('div','pos',(k+1)+'°'), ritr=el('div','ritr',c.nome[0]);
+    const mid=el('div'), nome=el('div','nome',c.nome), barra=el('div','barra'), fill=el('i'), sk=el('div','sk');
+    barra.appendChild(fill);
+    const img=ICONE.map((u,i)=>{ const m=el('img','off'); m.src=u; m.alt=SKILL[i]; m.title=SKILL[i]; sk.appendChild(m); return m; });
+    mid.append(nome,barra,sk);
+    const pt=el('div','punti'), num=el('b',null,'0'); pt.append(num,el('small',null,'punti'));
+    r.append(pos,ritr,mid,pt); r.style.transform='translateY('+U((k*PASSO).toFixed(1))+')';
+    pCase.appendChild(r);
+    R[c.id]={r,pos,ritr,fill,img,num,meta:0,mostra:0,testo:0,rango:k,skill:new Set()};
+  });
+  tab.append(testa,banda,sfida,pCase,pTop,aiuto);
+  document.body.appendChild(tab);
+
+  // ---------- ritratti delle mascotte (una volta, nel render target) ----------
+  function ritratti(){
+    const N=256, rt=new THREE.WebGLRenderTarget(N,N); rt.texture.encoding=THREE.sRGBEncoding;
+    const sc=new THREE.Scene(); sc.environment=scene.environment||null;
+    sc.add(new THREE.HemisphereLight(0xffffff,0x3a4766,.85));
+    const dl=new THREE.DirectionalLight(0xffffff,1.5); dl.position.set(.7,1.3,1.6); sc.add(dl);
+    const cam=new THREE.PerspectiveCamera(28,1,.05,10);
+    const px=new Uint8Array(N*N*4), cv=mkCanvas(N,N), g=cv.getContext('2d'), im=g.createImageData(N,N);
+    const prevT=renderer.getRenderTarget(), prevC=renderer.getClearColor(new THREE.Color()), prevA=renderer.getClearAlpha();
+    renderer.setClearColor(0x000000,0);
+    try{
+      for(const c of CASE){
+        const M=mkMascotte(c.id); M.root.rotation.y=-.38; if(M.ombra) M.ombra.visible=false; sc.add(M.root);
+        sc.updateMatrixWorld(true);
+        const bb=new THREE.Box3().setFromObject(M.testa||M.root), cy=(bb.min.y+bb.max.y)/2;
+        cam.position.set(.07,cy+.02,.62); cam.lookAt(0,cy-.07,0);
+        renderer.setRenderTarget(rt); renderer.clear(); renderer.render(sc,cam);
+        renderer.readRenderTargetPixels(rt,0,0,N,N,px);
+        for(let y=0;y<N;y++) im.data.set(px.subarray((N-1-y)*N*4,(N-y)*N*4),y*N*4);
+        g.putImageData(im,0,0);
+        const m=new Image(); m.alt=c.nome; m.src=cv.toDataURL(); R[c.id].ritr.textContent=''; R[c.id].ritr.appendChild(m);
+        sc.remove(M.root);
+      }
+    } finally { renderer.setRenderTarget(prevT); renderer.setClearColor(prevC,prevA); rt.dispose(); }
+  }
+  try{ ritratti(); }catch(e){ console.info('tabellone: ritratti non disponibili',e); }   // resta l'iniziale della Casa
+
+  // ---------- disegno dei dati ----------
+  let ordine=[], prima={}, primoGiro=true, firmaTop=null, puntiPrima={}, okAt=0, guasto=false, tBanda=0;
+  const ora=t=>{ const d=new Date(t); return String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0'); };
+  function disegna(){
+    const t=totaliCorrenti(), tot=id=>t[id].punti+t[id].attesa;
+    const rg=id=>{ const i=ordine.indexOf(id); return i<0?CASE.findIndex(c=>c.id===id):i; };
+    const ord=CASE.map(c=>c.id).sort((a,b)=>(tot(b)-tot(a))||(rg(a)-rg(b)));      // a pari punti resta l'ordine di prima
+    const max=Math.max(1,...ord.map(tot));
+    // sorpasso: X aveva meno punti di Y e ora ne ha di più (a pari punti non è un sorpasso).
+    // Se più Case salgono si annuncia quella che ne scavalca di più, contro la più alta superata.
+    let su=null;
+    if(!primoGiro) for(const x of ord){ const sup=ord.filter(y=>prima[y]>prima[x] && tot(x)>tot(y));
+      if(sup.length && (!su || sup.length>su.n)) su={id:x,n:sup.length,sotto:sup.reduce((a,b)=>prima[b]>prima[a]?b:a)}; }
+    ord.forEach((id,k)=>{
+      const x=R[id]; x.rango=k; x.meta=tot(id);
+      x.r.style.transform='translateY('+U((k*PASSO).toFixed(1))+')'; x.pos.textContent=(k+1)+'°';
+      x.r.classList.toggle('primo',k===0 && x.meta>0);
+      x.fill.style.width=(x.meta/max*100).toFixed(1)+'%';
+      if(RIDOTTO || primoGiro){ x.mostra=x.meta; x.testo=x.meta; x.num.textContent=x.meta; }
+      x.img.forEach((m,i)=>{ const on=t[id].emblemi.has(i+1);
+        if(on && !x.skill.has(i+1) && !primoGiro){ m.classList.remove('nuova'); void m.offsetWidth; m.classList.add('nuova'); }
+        m.classList.toggle('off',!on); if(on) x.skill.add(i+1); else x.skill.delete(i+1); });
+    });
+    if(su){
+      const sotto=su.sotto, x=R[su.id]; x.r.classList.remove('sale'); void x.r.offsetWidth; x.r.classList.add('sale');
+      setTimeout(()=>x.r.classList.remove('sale'),3200);
+      const riga=el('div'); riga.append(el('b',null,CASE.find(c=>c.id===su.id).nome),' supera ',el('b',null,CASE.find(c=>c.id===sotto).nome));
+      banda.textContent=''; banda.append(el('small',null,'Sorpasso!'),riga);
+      banda.classList.add('vivo'); clearTimeout(tBanda); tBanda=setTimeout(()=>banda.classList.remove('vivo'),5000);
+    }
+    const capo=ord[0], cambio=ordine[0]!==capo || primoGiro;
+    ordine=ord; for(const id of ord) prima[id]=tot(id);
+    // maxischermo del laboratorio: chi è in testa
+    if(cambio){ const c=CASE.find(k=>k.id===capo);
+      if(tot(capo)>0) disegnaTV('Sfida tra Casate','In testa: '+c.nome,c.css); else disegnaTV('Sfida tra Casate','Chi trova più skill?',''); }
+    // Top 10 (testo con textContent: niente HTML dai soprannomi)
+    const top=t.giocatori.slice(0,10), firma=top.map(g=>g.n+'|'+g.c+'|'+g.p).join(';');
+    if(firma!==firmaTop){
+      lista.textContent='';
+      top.forEach((g,i)=>{ const c=CASE.find(k=>k.id===g.c), li=el('li'), chi=el('div','chi'), key=g.n+'|'+g.c;
+        li.style.setProperty('--c2',c?COL[c.id]:'#9aa3b5');
+        chi.append(el('span',null,g.n),el('em',null,c?c.nome:''));
+        li.append(el('span','n',(i+1)+'.'),chi,el('b',null,String(g.p)));
+        if(!primoGiro && !(puntiPrima[key]>=g.p)) li.classList.add('su');
+        lista.appendChild(li); });
+      if(!top.length) lista.appendChild(el('li','vuoto','Ancora nessun punteggio: si comincia!'));
+      firmaTop=firma; puntiPrima={}; for(const g of t.giocatori) puntiPrima[g.n+'|'+g.c]=g.p;
+    }
+    // sfida attiva e stato della rete
+    const sf=(TOT&&TOT.sfida)||SFIDA_SERVER||'';
+    sfNome.textContent=URL_CLASSIFICA?(sf||'—'):'Questo computer';
+    rete.classList.toggle('ko',guasto);
+    rete.textContent=!URL_CLASSIFICA?'Punti di oggi'
+      :guasto?(okAt?'Rete assente: dati delle '+ora(okAt):'Rete assente: riprovo tra poco')
+      :'Aggiornato alle '+ora(okAt);
+    if(okAt) primoGiro=false;                       // i guizzi partono solo dopo i primi dati veri
+  }
+
+  // ---------- lettura dal Foglio (stessa action=case di leggiTotali) ----------
+  async function carica(){
+    if(URL_CLASSIFICA){
+      const ctl=new AbortController(), tm=setTimeout(()=>ctl.abort(),9000);
+      try{ const j=await (await fetch(URL_CLASSIFICA+'?action=case',{cache:'no-store',signal:ctl.signal})).json();
+        if(j && j.ok){ TOT=j; okAt=Date.now(); guasto=false; } else guasto=true; }
+      catch(e){ guasto=true; }                    // rete giù, timeout, pagina d'errore: restano gli ultimi dati
+      finally{ clearTimeout(tm); }
+    } else okAt=Date.now();
+    disegna();
+  }
+  const ciclo=()=>{ carica().catch(e=>console.error('tabellone',e)).finally(()=>setTimeout(ciclo,PERIODO)); };
+  ciclo();
+  suEvento('tabellone:aggiorna',()=>{ carica(); });      // per i controlli: emetti('tabellone:aggiorna')
+
+  // ---------- punti che salgono contando (solo testo, nessuna allocazione) ----------
+  suEvento('frame',dt=>{
+    for(const c of CASE){ const x=R[c.id]; if(x.mostra===x.meta) continue;
+      x.mostra+=(x.meta-x.mostra)*Math.min(1,dt*2.4); if(Math.abs(x.meta-x.mostra)<.5) x.mostra=x.meta;
+      const v=Math.round(x.mostra); if(v!==x.testo){ x.testo=v; x.num.textContent=v; } }
+  });
+
+  // ---------- proiettore: schermo intero, puntatore nascosto, schermo sempre acceso ----------
+  const intero=()=>{ try{ if(document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen().catch(()=>{}); }catch(e){} };
+  addEventListener('dblclick',intero);
+  addEventListener('keydown',e=>{ if(e.code==='KeyF') intero(); });
+  let tCur=0;
+  const muovi=()=>{ document.body.classList.remove('tbNoCur'); aiuto.classList.add('vivo'); clearTimeout(tCur);
+    tCur=setTimeout(()=>{ document.body.classList.add('tbNoCur'); aiuto.classList.remove('vivo'); },3000); };
+  addEventListener('mousemove',muovi); muovi();
+  const sveglia=async()=>{ try{ if(navigator.wakeLock && document.visibilityState==='visible') await navigator.wakeLock.request('screen'); }catch(e){} };
+  document.addEventListener('visibilitychange',sveglia); sveglia();
+})();
+
 /* ==== EXTRA:FINE ==== */
 
 animate();
